@@ -854,16 +854,19 @@ export class KernelStore {
     return Number(row?.count ?? 0) || 0
   }
 
-  saveSnapshot(state: JsonRecord) {
+  saveSnapshot(state: JsonRecord, options: { requireOwner?: boolean } = {}) {
     if (this.#closed) {
+      if (options.requireOwner) throw new Error('The session store is closed. The update was not installed.')
       return
     }
     // In-memory stores are never reloaded; persisting a snapshot into them
     // would be pure serialization overhead on every touch.
     if (!this.databaseFile) {
+      if (options.requireOwner) throw new Error('No durable session store is available. The update was not installed.')
       return
     }
     if (this.getMeta('snapshot-owner') !== this.#epoch) {
+      if (options.requireOwner) throw new Error('Another runtime owns the session store. The update was not installed.')
       if (!this.#staleSnapshotWarned) {
         this.#staleSnapshotWarned = true
         console.warn(
@@ -880,6 +883,7 @@ export class KernelStore {
     const serialized = JSON.stringify(durableState)
     this.#db.exec('BEGIN IMMEDIATE')
     try {
+      if (options.requireOwner && this.getMeta('snapshot-owner') !== this.#epoch) throw new Error('Another runtime owns the session store. The update was not installed.')
       this.#db.prepare(
         `INSERT INTO runtime_state (singleton, version, event_seq, updated_at, state)
          VALUES (1, ?, ?, ?, ?)

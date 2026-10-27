@@ -80,6 +80,7 @@ export class CommandExecutor {
   #host: CommandExecutorHost
   #context = new AsyncLocalStorage<ControlTransaction>()
   #chain: Promise<void> = Promise.resolve()
+  #pendingCommandCount = 0
   #committedStateDuringCommand: JsonRecord | undefined
   #snapshotPersistTimer: ReturnType<typeof setTimeout> | undefined
   #snapshotPersistDelayMs: number
@@ -112,6 +113,8 @@ export class CommandExecutor {
     return this.#committedStateDuringCommand
   }
 
+  pendingCommandCount() { return this.#pendingCommandCount }
+
   currentTransaction() {
     const transaction = this.#context.getStore()
     return transaction && transaction.closed !== true
@@ -135,7 +138,8 @@ export class CommandExecutor {
       actorKind && actorKind !== 'runtime'
         ? this.#host.reviveAutonomousDrains()
         : undefined
-    const run = this.#chain.then(() => this.#dispatch(command, lifecycleEpochs))
+    this.#pendingCommandCount += 1
+    const run = this.#chain.then(() => this.#dispatch(command, lifecycleEpochs)).finally(() => { this.#pendingCommandCount -= 1 })
     this.#chain = run.then(
       () => undefined,
       () => undefined,
@@ -794,9 +798,9 @@ export class CommandExecutor {
     this.#snapshotPersistTimer.unref?.()
   }
 
-  persistState() {
+  persistState(options: { requireOwner?: boolean } = {}) {
     this.#clearSnapshotPersistTimer()
-    this.#kernelStore.saveSnapshot(this.#host.getState())
+    this.#kernelStore.saveSnapshot(this.#host.getState(), options)
   }
 
   #clearSnapshotPersistTimer() {

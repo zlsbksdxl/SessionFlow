@@ -73,7 +73,7 @@ import type {
 } from '@/shared/graph-state';
 import type { PlanCouncil } from '@shared/plan-council';
 import type { ProviderInstance } from '@/shared/provider-runtime';
-import type { AppUpdateState } from '@shared/app-update';
+import type { AppUpdateState, AppUpdateReadiness } from '@shared/app-update';
 import type {
   ImportNativeSessionInput,
   ImportNativeSessionResult,
@@ -169,6 +169,8 @@ export type ElectronOrreryApi = {
     getState: () => Promise<AppUpdateState>;
     checkForUpdates: () => Promise<AppUpdateState>;
     openReleasePage: () => Promise<void>;
+    installUpdate: () => Promise<AppUpdateState>;
+    onBeforeInstall: (listener: () => AppUpdateReadiness | Promise<AppUpdateReadiness>) => () => void;
     onState: (listener: (state: AppUpdateState) => void) => () => void;
   };
   runtime: RuntimeApi;

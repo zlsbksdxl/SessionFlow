@@ -34,7 +34,7 @@ import { type RuntimeCoreState } from '@/hooks/use-runtime-core';
 import { type SessionListState } from '@/hooks/use-session-list';
 import { type SessionActionsState } from '@/hooks/use-session-actions';
 import { type InteractionsState } from '@/hooks/use-interactions';
-import { AppUpdateNotice } from '@/components/app-update-notice';
+import { AppUpdateButton } from '@/components/app-update-button';
 import { SidebarSettings } from '@/components/sidebar-settings';
 import { ChatSearchDialog } from '@/components/chat-search-dialog';
 import { ProjectChatSection } from '@/components/project-chat-section';
@@ -46,6 +46,8 @@ import { ChatRenameDialog } from '@/components/chat-rename-dialog';
 import { groupChatsByProject, isChatInProject } from '@/lib/session-project-groups';
 import { useChatProjects } from '@/hooks/use-chat-projects';
 import { useChatProjectDrag } from '@/hooks/use-chat-project-drag';
+import { useProjectOrderDrag } from '@/hooks/use-project-order-drag';
+import { orderProjectGroups } from '@/lib/project-order';
 import type { LayoutPrefsState } from '@/hooks/use-layout-prefs';
 import { preferRuntimeSnapshot } from '../../shared/runtime-state-patch';
 
@@ -249,7 +251,11 @@ export function SidebarRail({
       (pinRanks.get(left.sessionId) ?? Number.MAX_SAFE_INTEGER) - (pinRanks.get(right.sessionId) ?? Number.MAX_SAFE_INTEGER) ||
       right.updatedAt.localeCompare(left.updatedAt),
   );
-  const projectGroups = groupChatsByProject<AgentSession | CollaborationSession>(sidebarChats, chatProjects).sort(
+  const baseProjectGroups = groupChatsByProject<AgentSession | CollaborationSession>(sidebarChats, chatProjects).sort(
+    (left, right) => Number(Boolean(chatProjects[right.key]?.pinned)) - Number(Boolean(chatProjects[left.key]?.pinned)),
+  );
+  const projectDrag = useProjectOrderDrag({ projects: chatProjects, projectIds: baseProjectGroups.map((group) => group.key) });
+  const projectGroups = orderProjectGroups(baseProjectGroups, projectDrag.projectOrder).sort(
     (left, right) => Number(Boolean(chatProjects[right.key]?.pinned)) - Number(Boolean(chatProjects[left.key]?.pinned)),
   );
   const projectSectionViews = [
@@ -779,6 +785,9 @@ export function SidebarRail({
         <p role="status" aria-live="polite" className="sr-only">
           {chatDrag.announcement}
         </p>
+        <p role="status" aria-live="polite" className="sr-only">
+          {projectDrag.announcement}
+        </p>
         {projectError ? (
           <p role="alert" className="mb-2 rounded-lg bg-term-rose/5 px-2 py-2 text-xs leading-5 text-term-rose">
             {projectError}
@@ -834,6 +843,7 @@ export function SidebarRail({
                   return (
                     <ProjectChatSection
                       key={group.key}
+                      projectId={group.key}
                       label={group.label}
                       cwd={group.cwd}
                       connectionHost={project.connection?.kind === 'ssh' ? project.connection.host : undefined}
@@ -845,6 +855,9 @@ export function SidebarRail({
                       dropTargetProps={chatDrag.targetProps(group.key)}
                       dropState={chatDrag.dropState(group.key)}
                       movePending={chatDrag.targetPending(group.key)}
+                      reorderHeaderProps={{ ...projectDrag.sourceProps(group.key), ...projectDrag.targetProps(group.key) }}
+                      reorderPlacement={projectDrag.hoveredTarget?.projectId === group.key ? projectDrag.hoveredTarget.placement : undefined}
+                      isReordering={projectDrag.draggedProjectId === group.key}
                       onNewChat={isRuntimeAvailable ? () => startProjectChat(group.key) : undefined}
                       onTogglePin={() => void runProjectAction(() => updateProject(group.key, { pinned: !project.pinned }))}
                       onEdit={() => setProjectSettings({ projectId: group.key, mode: 'edit' })}
@@ -1036,9 +1049,11 @@ export function SidebarRail({
           }}
         />
       ) : null}
-      {isElectron ? <AppUpdateNotice /> : null}
       <footer className="app-region-no-drag flex shrink-0 items-center gap-3 border-t border-border px-2 py-1.5 font-mono text-[11px] tracking-[0.02em] text-muted-foreground">
-        <SidebarSettings activeTab={activeTab} onOpenAgentSettings={() => setActiveTab('agents')} onOpenAppearance={() => setActiveTab('appearance')} />
+        <div className="flex shrink-0 items-center gap-1">
+          <SidebarSettings activeTab={activeTab} onOpenAgentSettings={() => setActiveTab('agents')} onOpenAppearance={() => setActiveTab('appearance')} />
+          {isElectron ? <AppUpdateButton /> : null}
+        </div>
         <div className="ml-auto flex items-center gap-3">
           <span className="flex items-center gap-1.5" title={`${runningSessions.length} running / ${sessions.length} total chats`}>
             <span className={cn('size-1.5 rounded-full', runningSessions.length > 0 ? 'bg-emerald-500' : 'bg-muted-foreground/40')} />

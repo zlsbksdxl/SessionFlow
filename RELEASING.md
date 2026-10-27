@@ -17,7 +17,44 @@ All installer output goes to `outputs/release/`. Every release includes:
 - `latest-mac.yml`
 - `SHA256SUMS`, covering the five files above
 
-## Ad-hoc release without Apple credentials
+## Stable automatic-update releases
+
+Stable releases used by the automatic updater must be Developer ID signed and
+Apple notarized. The workflow defaults to **signed** and fails when signing
+credentials, the expected Team ID, or notarization checks are missing or fail.
+It never falls back to an ad-hoc build. Keep the existing bundle identifier,
+signing team, and native code-signing requirement compatible between releases.
+The updater needs the ZIP and `latest-mac.yml`; retain the DMG, blockmaps, and
+checksums as well.
+
+The Update button beside Settings downloads the update, then waits for running
+tasks to become idle and saves application state before asking the native
+macOS updater to install and restart. Downloading does not terminate running
+tasks. Do not replace this with an installer script, weaken signature
+validation, or describe a successful download as a successful installation.
+
+### One-time migration from the existing ad-hoc builds
+
+The currently published `v0.3.0` is ad-hoc signed without Developer ID signing
+or Apple notarization. It predates the stable-feed policy above. Its macOS
+designated requirement identifies that exact build by code hash; a different
+build cannot satisfy it. Squirrel.Mac checks an update against the running
+app's designated requirement. Consequently, an existing ad-hoc installation
+cannot automatically migrate to the first Developer ID signed release.
+
+Users must manually install that first signed release once, using its DMG or
+ZIP from GitHub. Later compatible signed releases can use the Update button.
+Keep application storage identity unchanged so this manual replacement retains
+saved chats and settings. Keep the old release, tag, and assets as historical
+records; do not rewrite them to claim a different signature. Until the first
+signed stable release is published, GitHub's latest release may still point at
+the historical ad-hoc `v0.3.0`; that does not establish automatic-installation
+support.
+
+See the [Electron autoUpdater documentation](https://www.electronjs.org/docs/latest/api/auto-updater)
+and [Squirrel.Mac code-signature verification](https://github.com/Squirrel/Squirrel.Mac/blob/main/Squirrel/SQRLCodeSignature.m).
+
+## Manual-install ad-hoc prerelease without Apple credentials
 
 Use the explicit ad-hoc build on an Apple Silicon Mac with Node.js 24:
 
@@ -34,6 +71,11 @@ signature for code integrity, but have **no Developer ID signing or Apple
 notarization**. macOS Gatekeeper may block their first launch. Public release
 notes must state that limitation; do not describe this mode as notarized or as
 Developer ID signed.
+
+New ad-hoc builds are **manual-install-only prereleases**. Publish them with
+GitHub's prerelease flag and `--latest=false`, even when the version tag uses
+`X.Y.Z`. They must not replace a signed stable release or its update feed.
+The application's stable updater excludes prereleases.
 
 ### Installing the first macOS build
 
@@ -53,16 +95,19 @@ manifest from inside the output directory:
 
 ```sh
 cd outputs/release
-shasum -a 256 SessionFlow-0.3.0-mac-arm64.dmg SessionFlow-0.3.0-mac-arm64.zip \
-  SessionFlow-0.3.0-mac-arm64.dmg.blockmap SessionFlow-0.3.0-mac-arm64.zip.blockmap \
+shasum -a 256 SessionFlow-0.3.1-mac-arm64.dmg SessionFlow-0.3.1-mac-arm64.zip \
+  SessionFlow-0.3.1-mac-arm64.dmg.blockmap SessionFlow-0.3.1-mac-arm64.zip.blockmap \
   latest-mac.yml > SHA256SUMS
 shasum -a 256 -c SHA256SUMS
 ```
 
 When publishing locally, create a draft for the exact verified commit, upload
-all six files, read back the assets and release notes, then publish the draft.
+all six files, and read back the assets and release notes. For an ad-hoc build,
+create that draft with `--prerelease --latest=false`, then publish it using
+`gh release edit <tag> --draft=false --prerelease --latest=false`.
 Keep the public note: **Ad-hoc signed; no Developer ID signing or Apple
-notarization.** Use a stable version tag such as `v0.3.0`.
+notarization. Manual installation only; excluded from stable automatic
+updates.** Use a fresh version tag; never replace the existing `v0.3.0` assets.
 
 ### Versioned branding transition
 
@@ -82,20 +127,22 @@ Creating a local release or pushing its tag does not start a second publisher.
 Choose either local publishing or the workflow for a version.
 
 In the repository's Actions tab, choose the intended commit/ref, enter the
-stable version, and leave **signed** unchecked for the explicit ad-hoc,
-unnotarized path. It needs no Apple secrets. The workflow runs deterministic
-checks, builds the app, verifies its identity/signature/architecture/update
-feed, checks all required assets, and publishes with the unnotarized notice.
+fresh version, and keep **signed** checked for a stable automatic-update
+release. Configure the Apple credentials below first. Explicitly unchecking
+**signed** selects the ad-hoc, unnotarized path and needs no Apple secrets;
+that path publishes a manual-install-only prerelease with `--latest=false`.
+The workflow runs deterministic checks, builds the app, verifies its
+identity/signature/architecture/update feed, and checks all required assets.
 It uploads to a draft and verifies the six remote asset names and sizes before
-publishing that draft.
+publishing that draft. Only the signed path marks its release as latest.
 Its `gh release create` command fails if that release already exists, including
 an existing draft; it does not replace a local publication. If the tag already
 exists, it must point to the selected workflow commit. Otherwise GitHub creates
 the version tag at that exact commit when publishing.
 
-## Optional Developer ID signed and notarized release
+## Developer ID signed and notarized release
 
-Select **signed** only after configuring all five Actions secrets:
+Before using the default **signed** path, configure all five Actions secrets:
 
 - `CSC_LINK`: base64-encoded Developer ID Application `.p12`
 - `CSC_KEY_PASSWORD`: the `.p12` export password
@@ -131,5 +178,12 @@ notarization. Keep signing credentials out of the repository and release
 assets.
 
 Development builds disable update checks. Test the configured feed from the
-packaged app; a first release can establish feed reachability, while a later
-higher version is needed to verify that an update is offered.
+packaged app. State-machine or mocked-downloader checks can verify prompts,
+progress, retries, idle waiting, and save-before-install ordering; they do not
+verify native installation. A real end-to-end installation check requires two
+different compatible Developer ID signed builds, a higher update version, and
+an isolated installed app and data directory. Verify the relaunched version
+and saved data after installation. An ad-hoc build can establish feed
+reachability and version detection, but cannot prove this signed installation
+path. Publishing a release or a passing packaging command alone is not an
+installation test.

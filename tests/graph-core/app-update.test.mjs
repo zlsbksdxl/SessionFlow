@@ -9,6 +9,7 @@ import {
   markAppUpdateError,
   markAppUpToDate,
   startAppUpdateCheck,
+  appUpdateRuntimeBlockers,
 } from '../../dist-electron/shared/app-update.js';
 
 test('automatic update checks are limited to packaged macOS arm64 builds with a feed', () => {
@@ -48,6 +49,19 @@ test('automatic update checks are limited to packaged macOS arm64 builds with a 
     }),
     /feed/,
   );
+});
+
+test('automatic installation waits for provider, queue and workflow activity while terminal history is idle', () => {
+  assert.deepEqual(appUpdateRuntimeBlockers({ sessions: { old: { status: 'failed' }, paused: { status: 'idle', threadGoal: { status: 'paused' } } }, workflowPlans: { done: { 1: { status: 'completed' } } }, planCouncils: { finished: { phase: 'completed' } } }), []);
+  for (const state of [
+    { sessions: { one: { status: 'pending' } } },
+    { sessions: { one: { status: 'running' } } },
+    { sessions: { one: { status: 'idle', threadGoal: { status: 'active' } } } },
+    { runQueue: [{}] }, { workspaceLeases: [{ status: 'active' }] }, { pendingActivations: { turn: {} } },
+    { clusters: { group: { loopState: { status: 'running' } } } }, { planCouncils: { council: { phase: 'ready-for-synthesis' } } },
+    { workflowPlans: { plan: { 1: { status: 'active' } } } }, { dynamicSpawnGroups: { group: { status: 'creating' } } },
+    { collaborationSessions: { group: { discussions: { one: { status: 'active' } } } } },
+  ]) assert.ok(appUpdateRuntimeBlockers(state).length > 0);
 });
 
 test('update detection state keeps the available version until a no-update result', () => {

@@ -4,6 +4,8 @@ Projects and Recents are separate sidebar sections. Recents contains chats witho
 
 Drag a chat row onto a project folder to move it there, or onto Recents to remove its project membership while keeping its working directory. Drop targets highlight while dragging. Hover over a collapsed folder or Recents to expand it; pressing Escape cancels the drag. Busy chats cannot be moved, and existing workspace and workflow restrictions still apply.
 
+Drag a project title above or below another project to reorder folders in the same section. Pinned projects stay above unpinned projects. The order is saved on this computer. You can also focus a project title and press **Alt + Up/Down** to move it; the project's chats stay in their existing order.
+
 Hover over a project to reveal its options and new-chat buttons. Right-clicking the project opens the same options:
 
 - **Pin / Unpin** puts the project first within its section.

@@ -5,14 +5,14 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Stable release version, for example 0.3.0'
+        description: 'Release version, for example 0.3.1'
         required: true
-        default: '0.3.0'
+        default: '0.3.1'
         type: string
       signed:
-        description: 'Use Developer ID signing and Apple notarization (requires all Apple credentials)'
+        description: 'Developer ID signed stable release; disable only for a manual-install prerelease'
         required: true
-        default: false
+        default: true
         type: boolean
 
 permissions:
@@ -199,6 +199,7 @@ jobs:
             printf '%s\n\n' '**Apple Silicon (arm64). Developer ID signed and Apple notarized.**' > "$notes"
           else
             printf '%s\n\n' '**Apple Silicon (arm64). Ad-hoc signed; no Developer ID signing or Apple notarization.**' > "$notes"
+            printf '%s\n\n' '**Manual installation only. This prerelease is excluded from the stable automatic-update feed.**' >> "$notes"
             printf '%s\n\n' 'macOS Gatekeeper may block the first launch of this unnotarized build.' >> "$notes"
           fi
           printf '%s\n' 'Download the DMG to install SessionFlow, or use the ZIP. SHA256SUMS covers both archives, their update blockmaps, and latest-mac.yml.' >> "$notes"
@@ -211,9 +212,14 @@ jobs:
             "outputs/release/SHA256SUMS"
           )
           # gh refuses to replace an existing release, including a local draft.
+          # Unsigned builds must never replace a signed stable update feed.
+          release_flags=(--draft)
+          if [[ "$SIGNED_RELEASE" != "true" ]]; then
+            release_flags+=(--prerelease --latest=false)
+          fi
           gh release create "$RELEASE_TAG" "${assets[@]}" \
             --target "$GITHUB_SHA" --title "SessionFlow $RELEASE_VERSION" \
-            --notes-file "$notes" --draft
+            --notes-file "$notes" "${release_flags[@]}"
           gh release view "$RELEASE_TAG" --json assets > "$RUNNER_TEMP/looperators-release-assets.json"
           node --input-type=module - "$RUNNER_TEMP/looperators-release-assets.json" "${assets[@]}" <<'NODE'
           import assert from 'node:assert/strict';
@@ -228,7 +234,11 @@ jobs:
             assert.equal(asset.size, fs.statSync(file).size, `Uploaded size mismatch: ${asset.name}`);
           }
           NODE
-          gh release edit "$RELEASE_TAG" --draft=false --latest
+          if [[ "$SIGNED_RELEASE" == "true" ]]; then
+            gh release edit "$RELEASE_TAG" --draft=false --prerelease=false --latest
+          else
+            gh release edit "$RELEASE_TAG" --draft=false --prerelease --latest=false
+          fi
 
       - name: Remove temporary notarization key
         if: ${{ always() && inputs.signed }}

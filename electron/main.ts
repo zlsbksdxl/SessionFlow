@@ -2,11 +2,12 @@ import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { randomUUID } from 'node:crypto'
 import { RuntimeSessionManager } from './runtime/sessionManager.js'
 import { createBatchedRuntimeEventEmitter } from './runtime/runtimeEventDelivery.js'
 import { hydrateProcessEnvironment } from './runtime/hostEnvironment.js'
 import { AppUpdateController } from './appUpdater.js'
-import type { AppUpdateState } from '../shared/app-update.js'
+import type { AppUpdateState, AppUpdateReadiness } from '../shared/app-update.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const devServerUrl = process.env.VITE_DEV_SERVER_URL
@@ -20,6 +21,36 @@ let runtime: RuntimeSessionManager | undefined
 let updates: AppUpdateController | undefined
 let quitFlushStarted = false
 let quitFlushComplete = false
+let updateInstallPreparing = false
+let updatePrepareEpoch = 0
+let runtimeOperationsInFlight = 0
+let updateWindowCheck: { requestId: string; receive: (senderId: number, readiness: AppUpdateReadiness) => void } | undefined
+
+function runtimeOperation<T>(run: () => T | Promise<T>): Promise<T> {
+  if (updateInstallPreparing) return Promise.reject(new Error('SessionFlow is restarting to install an update.'))
+  runtimeOperationsInFlight += 1
+  try { return Promise.resolve(run()).finally(() => { runtimeOperationsInFlight -= 1 }) }
+  catch (error) { runtimeOperationsInFlight -= 1; throw error }
+}
+
+function rendererUpdateReadiness(): Promise<AppUpdateReadiness> {
+  const windows = BrowserWindow.getAllWindows().filter((window) => !window.isDestroyed() && !window.webContents.isDestroyed())
+  if (!windows.length) return Promise.resolve({ ready: false, reason: 'Open the application window to finish the update.' })
+  const requestId = randomUUID()
+  return new Promise((resolve) => {
+    const pending = new Set(windows.map((window) => window.webContents.id))
+    const responses: AppUpdateReadiness[] = []
+    const finish = (result: AppUpdateReadiness) => { clearTimeout(timer); if (updateWindowCheck?.requestId === requestId) updateWindowCheck = undefined; resolve(result) }
+    const timer = setTimeout(() => finish({ ready: false, reason: 'Waiting for all windows to confirm their work is saved.' }), 5000)
+    timer.unref()
+    updateWindowCheck = { requestId, receive: (senderId, readiness) => {
+      if (!pending.delete(senderId)) return
+      responses.push(readiness)
+      if (!pending.size) finish(responses.find((response) => !response.ready) ?? { ready: true })
+    } }
+    for (const window of windows) window.webContents.send('orrery:before-update-install', { requestId })
+  })
+}
 
 function sendRuntimeEvent(event) {
   for (const window of BrowserWindow.getAllWindows()) {
@@ -66,6 +97,12 @@ function createMainWindow() {
 }
 
 app.whenReady().then(async () => {
+  app.setAboutPanelOptions({
+    applicationName: app.getName(),
+    applicationVersion: app.getVersion(),
+    version: '',
+  })
+
   if (process.platform === 'darwin') {
     app.dock?.setIcon(appIconPath)
   }
@@ -74,15 +111,36 @@ app.whenReady().then(async () => {
   // Hydrate it before provider instances, probes, or adapters are created so
   // discovery and real sessions resolve the same executables.
   await hydrateProcessEnvironment()
-  updates = new AppUpdateController({ broadcast: broadcastUpdateState })
   runtime = new RuntimeSessionManager({
     storageFile:
       process.env.ORRERY_RUNTIME_STORAGE_FILE ??
       path.join(app.getPath('userData'), 'orrery-runtime-state.json'),
     broadcastRuntimeEvent,
   })
+  updates = new AppUpdateController({
+    broadcast: broadcastUpdateState,
+    getBlockers: () => [...(runtime?.getUpdateBlockers() ?? ['The runtime is starting']), ...(runtimeOperationsInFlight ? ['An application operation is still in progress'] : [])],
+    rendererReadiness: rendererUpdateReadiness,
+    prepareToInstall: async () => {
+      if (runtimeOperationsInFlight) throw Object.assign(new Error('An application operation is still in progress.'), { code: 'ORRERY_UPDATE_BUSY' })
+      updateInstallPreparing = true
+      const epoch = ++updatePrepareEpoch
+      try {
+        await runtime.prepareForUpdate()
+        if (epoch !== updatePrepareEpoch) throw new Error('The update preparation was cancelled.')
+        broadcastRuntimeEvent.flush()
+        quitFlushComplete = true
+      } catch (error) { if (epoch === updatePrepareEpoch) { updateInstallPreparing = false; quitFlushComplete = false } throw error }
+    },
+    resumeAfterFailure: () => {
+      updatePrepareEpoch += 1
+      updateInstallPreparing = false
+      quitFlushComplete = false
+      runtime?.resumeAfterUpdateFailure()
+    },
+  })
   const humanCommand = (kind: string, input: Record<string, any> = {}) =>
-    runtime.dispatchCommand({
+    runtimeOperation(() => runtime.dispatchCommand({
       kind,
       actor: { kind: 'human' },
       commandId: input?.commandId,
@@ -90,7 +148,7 @@ app.whenReady().then(async () => {
       expectedVersion: input?.expectedVersion,
       reason: input?.reason,
       input,
-    })
+    }))
 
   ipcMain.handle('orrery:runtime-state', () => runtime.getState())
   ipcMain.handle('orrery:update-state', () => updates.getState())
@@ -98,11 +156,21 @@ app.whenReady().then(async () => {
     updates.checkForUpdates('manual'),
   )
   ipcMain.handle('orrery:open-update-page', () => updates.openReleasePage())
+  ipcMain.handle('orrery:install-update', () => updates.installUpdate())
+  ipcMain.on('orrery:update-window-ready', (event, input) => {
+    if (updateWindowCheck?.requestId === input?.requestId) {
+      updateWindowCheck.receive(event.sender.id, { ready: input.ready === true, reason: typeof input.reason === 'string' ? input.reason.slice(0, 1000) : undefined })
+    } else if (!updateWindowCheck && !event.sender.isDestroyed()) {
+      // A slow readiness handler must release its inert root after its old
+      // request timed out; never unlock a newer in-flight readiness request.
+      event.sender.send('orrery:update-state-changed', updates.getState())
+    }
+  })
   ipcMain.handle('orrery:kernel-events', (_event, input) =>
     runtime.getKernelEvents(input),
   )
   ipcMain.handle('orrery:dispatch-command', (_event, command) =>
-    runtime.dispatchCommand({ ...command, actor: { kind: 'human' } }),
+    runtimeOperation(() => runtime.dispatchCommand({ ...command, actor: { kind: 'human' } })),
   )
   ipcMain.handle('orrery:loop-timeline', (_event, input) =>
     runtime.getLoopTimeline(input),
@@ -154,7 +222,7 @@ app.whenReady().then(async () => {
     humanCommand('remove_external_source', input),
   )
   ipcMain.handle('orrery:emit-external-event', (_event, input) =>
-    runtime.emitExternalEvent(input),
+    runtimeOperation(() => runtime.emitExternalEvent(input)),
   )
   ipcMain.handle('orrery:list-templates', () => runtime.listTemplates())
   ipcMain.handle('orrery:apply-template', (_event, input) =>
@@ -170,7 +238,7 @@ app.whenReady().then(async () => {
     runtime.getProjectContext(input),
   )
   ipcMain.handle('orrery:get-provider-setup-status', (_event, input) =>
-    runtime.getProviderSetupStatus(input),
+    runtimeOperation(() => runtime.getProviderSetupStatus(input)),
   )
   ipcMain.handle('orrery:upsert-provider-instance', (_event, input) =>
     humanCommand('upsert_provider_instance', input),
@@ -243,9 +311,9 @@ app.whenReady().then(async () => {
     humanCommand('stop_loop', input),
   )
   ipcMain.handle('orrery:freeze', (_event, input) => humanCommand('freeze', input))
-  ipcMain.handle('orrery:unfreeze', (_event, input) => runtime.unfreeze(input))
+  ipcMain.handle('orrery:unfreeze', (_event, input) => runtimeOperation(() => runtime.unfreeze(input)))
   ipcMain.handle('orrery:cleanup-channels', (_event, input) =>
-    runtime.cleanupChannels(input),
+    runtimeOperation(() => runtime.cleanupChannels(input)),
   )
   ipcMain.handle('orrery:get-working-tree-diff', (_event, input) =>
     runtime.getWorkingTreeDiff(input),
@@ -260,16 +328,16 @@ app.whenReady().then(async () => {
     runtime.openWorkspace(input),
   )
   ipcMain.handle('orrery:create-terminal', (_event, input) =>
-    runtime.createTerminal(input),
+    runtimeOperation(() => runtime.createTerminal(input)),
   )
   ipcMain.handle('orrery:get-terminal', (_event, input) =>
     runtime.getTerminal(input),
   )
   ipcMain.handle('orrery:run-terminal-command', (_event, input) =>
-    runtime.runTerminalCommand(input),
+    runtimeOperation(() => runtime.runTerminalCommand(input)),
   )
   ipcMain.handle('orrery:write-terminal-input', (_event, input) =>
-    runtime.writeTerminalInput(input),
+    runtimeOperation(() => runtime.writeTerminalInput(input)),
   )
   ipcMain.handle('orrery:clear-terminal', (_event, input) =>
     runtime.clearTerminal(input),
@@ -279,7 +347,7 @@ app.whenReady().then(async () => {
   )
 
   createMainWindow()
-  updates.configure()
+  await updates.configure()
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
@@ -296,7 +364,7 @@ app.whenReady().then(async () => {
 })
 
 app.on('window-all-closed', () => {
-  void runtime?.killAll()
+  if (!updateInstallPreparing) void runtime?.killAll()
 
   if (process.platform !== 'darwin') {
     app.quit()
@@ -304,9 +372,9 @@ app.on('window-all-closed', () => {
 })
 
 app.on('will-quit', (event) => {
-  broadcastRuntimeEvent.dispose()
-  updates?.dispose()
   if (quitFlushComplete) {
+    broadcastRuntimeEvent.dispose()
+    updates?.dispose()
     return
   }
 

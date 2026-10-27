@@ -42,6 +42,7 @@ export function useSessionComposerSettings(session: AgentSession | undefined) {
 
   return {
     ...values,
+    hasDrafts: drafts.size > 0,
     runtimeSettingsPatch: sessionComposerSettingsPatch(baseline, draft),
     setRuntimeMode,
     setModel,

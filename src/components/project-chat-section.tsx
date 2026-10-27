@@ -8,6 +8,7 @@ const itemClass =
 const contentClass = 'app-region-no-drag z-50 min-w-44 rounded-xl border border-border bg-popover p-1 text-popover-foreground shadow-lg outline-none';
 
 export function ProjectChatSection({
+  projectId,
   label,
   cwd,
   connectionHost,
@@ -27,8 +28,12 @@ export function ProjectChatSection({
   dropTargetProps,
   dropState,
   movePending,
+  reorderHeaderProps,
+  reorderPlacement,
+  isReordering,
   children,
 }: {
+  projectId?: string;
   label: string;
   cwd: string;
   connectionHost?: string;
@@ -48,6 +53,9 @@ export function ProjectChatSection({
   dropTargetProps?: Pick<HTMLAttributes<HTMLElement>, 'onDragEnter' | 'onDragOver' | 'onDragLeave' | 'onDrop'>;
   dropState?: 'available' | 'active';
   movePending?: boolean;
+  reorderHeaderProps?: HTMLAttributes<HTMLButtonElement>;
+  reorderPlacement?: 'before' | 'after';
+  isReordering?: boolean;
   children: ReactNode;
 }) {
   const [expanded, setExpanded] = useState(true);
@@ -131,13 +139,25 @@ export function ProjectChatSection({
         if (eligible && event.defaultPrevented) setExpanded(true);
       }}
       data-drop-state={dropState}
+      data-project-id={projectId}
+      data-reorder-placement={reorderPlacement}
       aria-busy={movePending || undefined}
       className={cn(
-        'mb-1 rounded-xl transition-[background-color,box-shadow,outline-color]',
+        'relative mb-1 rounded-xl transition-[background-color,box-shadow,outline-color,opacity]',
+        isReordering && 'opacity-50',
         dropState === 'available' && 'outline-1 -outline-offset-1 outline-dashed outline-accent-ink/20',
         dropState === 'active' && 'bg-accent-ink/5 ring-1 ring-accent-ink/40',
       )}
     >
+      {reorderPlacement ? (
+        <div
+          aria-hidden="true"
+          className={cn(
+            'pointer-events-none absolute inset-x-0 z-10 h-0.5 rounded-full bg-accent-ink/65',
+            reorderPlacement === 'before' ? '-top-0.5' : '-bottom-0.5',
+          )}
+        />
+      ) : null}
       <ContextMenu.Root
         onOpenChange={(open) => {
           setContextOpen(open);
@@ -150,13 +170,19 @@ export function ProjectChatSection({
             className="group/project-row relative flex items-center rounded-lg transition-colors hover:bg-foreground/[0.045] data-[menu-open=true]:bg-foreground/[0.045]"
           >
             <button
+              {...reorderHeaderProps}
               type="button"
               aria-label={`${expanded ? 'Collapse' : 'Expand'} project ${label}`}
               aria-expanded={expanded}
               aria-controls={listId}
-              title={connectionHost ? `${connectionHost}:${cwd}` : cwd || label}
-              onClick={() => setExpanded((current) => !current)}
-              className="flex w-full min-w-0 items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[13px] text-term-name transition-[padding] group-hover/project-row:pr-14 group-has-[:focus-visible]/project-row:pr-14 group-data-[menu-open=true]/project-row:pr-14 [@media(hover:none)]:pr-14 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring/70"
+              title={`${connectionHost ? `${connectionHost}:${cwd}` : cwd || label}${reorderHeaderProps?.draggable ? '\nDrag to reorder. Alt + Up/Down also moves this project.' : ''}`}
+              onClick={(event) => {
+                if (!event.defaultPrevented) setExpanded((current) => !current);
+              }}
+              className={cn(
+                'flex w-full min-w-0 items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[13px] text-term-name transition-[padding] group-hover/project-row:pr-14 group-has-[:focus-visible]/project-row:pr-14 group-data-[menu-open=true]/project-row:pr-14 [@media(hover:none)]:pr-14 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring/70',
+                reorderHeaderProps?.draggable && 'cursor-grab select-none active:cursor-grabbing',
+              )}
             >
               <FolderIcon aria-hidden="true" className="size-3.5 shrink-0 text-term-dim2" />
               <span className="min-w-0 flex-1">

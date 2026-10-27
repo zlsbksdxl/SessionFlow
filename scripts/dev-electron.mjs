@@ -11,7 +11,7 @@ import { promisify } from 'node:util'
 const require = createRequire(import.meta.url)
 const runFile = promisify(execFile)
 const repositoryRoot = fileURLToPath(new URL('../', import.meta.url))
-const cacheFormatVersion = 1
+const cacheFormatVersion = 2
 const bundleName = 'SessionFlow.app'
 const completionFile = 'prepared.json'
 
@@ -89,6 +89,17 @@ export async function prepareDevelopmentElectron() {
   if (typeof originalExecutablePath !== 'string') throw new Error('The installed electron package did not provide an executable path.')
   if (process.platform !== 'darwin') return { executablePath: originalExecutablePath }
 
+  const applicationPackagePath = path.join(repositoryRoot, 'package.json')
+  let applicationPackage
+  try {
+    applicationPackage = JSON.parse(await fs.readFile(applicationPackagePath, 'utf8'))
+  } catch (error) {
+    throw new Error(`Cannot read the application version from ${applicationPackagePath}: ${error.message}`, { cause: error })
+  }
+  const applicationVersion = typeof applicationPackage?.version === 'string' ? applicationPackage.version.trim() : ''
+  if (!applicationVersion) throw new Error(`Expected a non-empty string version in ${applicationPackagePath}.`)
+  const applicationBundleVersion = applicationVersion.split(/[-+]/, 1)[0]
+
   const sourceBundlePath = await fs.realpath(path.resolve(originalExecutablePath, '../../..'))
   if (path.extname(sourceBundlePath) !== '.app' || path.basename(originalExecutablePath) !== 'Electron') {
     throw new Error(`Expected an Electron.app bundle with the original Electron executable, received: ${originalExecutablePath}`)
@@ -107,6 +118,7 @@ export async function prepareDevelopmentElectron() {
   const hash = createHash('sha256')
   hash.update(JSON.stringify({
     formatVersion: cacheFormatVersion,
+    applicationVersion,
     electronVersion,
     sourceBundlePath,
     executable: {
@@ -144,6 +156,8 @@ export async function prepareDevelopmentElectron() {
     const plistPath = path.join(temporaryBundlePath, 'Contents', 'Info.plist')
     await setPlistString(plistPath, 'CFBundleName', 'SessionFlow')
     await setPlistString(plistPath, 'CFBundleDisplayName', 'SessionFlow')
+    await setPlistString(plistPath, 'CFBundleShortVersionString', applicationVersion)
+    await setPlistString(plistPath, 'CFBundleVersion', applicationBundleVersion)
     if (icon) {
       await fs.writeFile(path.join(temporaryBundlePath, 'Contents', 'Resources', 'SessionFlow.icns'), icon)
       await setPlistString(plistPath, 'CFBundleIconFile', 'SessionFlow.icns')

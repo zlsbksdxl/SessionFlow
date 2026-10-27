@@ -1,8 +1,9 @@
 import { useId } from 'react';
 import { Popover } from 'radix-ui';
-import { Bot, ChevronRight, Palette, Settings } from 'lucide-react';
+import { Bot, ChevronRight, LoaderCircle, Palette, RefreshCw, Settings } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import type { RailTab } from '@/lib/layout-prefs';
+import { useAppUpdate } from '@/hooks/use-app-update';
 
 export function SidebarSettings({
   activeTab,
@@ -14,6 +15,8 @@ export function SidebarSettings({
   onOpenAppearance: () => void;
 }) {
   const titleId = useId();
+  const { state: updateState, actionError, checkForUpdates } = useAppUpdate();
+  const updateBusy = updateState && ['checking', 'downloading', 'downloaded', 'waiting-for-idle', 'installing'].includes(updateState.status);
   const entries = [
     { id: 'agents', label: 'Agent providers', icon: Bot, onSelect: onOpenAgentSettings },
     { id: 'appearance', label: 'Appearance', icon: Palette, onSelect: onOpenAppearance },
@@ -63,6 +66,34 @@ export function SidebarSettings({
               );
             })}
           </div>
+          {updateState ? (
+            <div className="mt-2 space-y-1 border-t border-border/70 pt-2">
+              <div className="flex items-center justify-between gap-2 px-2 text-xs text-muted-foreground">
+                <span>SessionFlow</span>
+                <span>{updateState.currentVersion}</span>
+              </div>
+              <Button
+                variant="ghost"
+                className="w-full justify-start gap-2 px-2"
+                disabled={!updateState.enabled || Boolean(updateBusy)}
+                onClick={() => void checkForUpdates()}
+              >
+                {updateState.status === 'checking' ? <LoaderCircle className="size-4 animate-spin" /> : <RefreshCw className="size-4 text-muted-foreground" />}
+                {updateState.status === 'checking' ? 'Checking for updates…' : 'Check for updates'}
+              </Button>
+              {updateState.status === 'up-to-date' ? (
+                <p role="status" className="px-2 text-xs text-muted-foreground">
+                  You’re up to date.
+                </p>
+              ) : null}
+              {updateState.status === 'disabled' ? <p className="px-2 text-xs leading-5 text-muted-foreground">{updateState.message}</p> : null}
+              {actionError || (updateState.status === 'error' && updateState.errorStage === 'check') ? (
+                <p role="alert" className="break-words px-2 text-xs leading-5 text-destructive">
+                  {actionError ?? updateState.message}
+                </p>
+              ) : null}
+            </div>
+          ) : null}
         </Popover.Content>
       </Popover.Portal>
     </Popover.Root>

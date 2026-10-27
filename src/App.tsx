@@ -28,6 +28,7 @@ import { useDiffPanel } from '@/hooks/use-diff-panel';
 import { useCanvas } from '@/hooks/use-canvas';
 import { useOrchestration } from '@/hooks/use-orchestration';
 import { useDraftGraph } from '@/hooks/use-draft-graph';
+import { useAppUpdateRestartGuard } from '@/hooks/use-app-update-restart-guard';
 import { PlanCouncilWorkbench } from '@/components/plan-council-workbench';
 import { AgentSettingsPanel } from '@/components/agent-settings-panel';
 import { AppearanceSettingsPanel } from '@/components/appearance-settings-panel';
@@ -123,9 +124,13 @@ function App() {
     restoreCwdFallback,
   } = newChat;
   const remoteWorkspaceSelected = selectedSession ? selectedSession.workspaceConnection?.kind === 'ssh' : newWorkspaceConnection.kind === 'ssh';
-  const localWorkflowCwd = newWorkspaceConnection.kind === 'ssh'
-    ? latestSessionCwd(sessions.filter((session) => session.workspaceConnection?.kind !== 'ssh'), invalidProjectCwds) ?? defaultWorkspaceCwd()
-    : newCwd;
+  const localWorkflowCwd =
+    newWorkspaceConnection.kind === 'ssh'
+      ? (latestSessionCwd(
+          sessions.filter((session) => session.workspaceConnection?.kind !== 'ssh'),
+          invalidProjectCwds,
+        ) ?? defaultWorkspaceCwd())
+      : newCwd;
   const requireLocalWorkflow = () => {
     if (!remoteWorkspaceSelected) return true;
     setRuntimeError('Workflows and group chats currently require a project on this computer. Choose a local project first.');
@@ -237,6 +242,18 @@ function App() {
     setRuntimeState,
     setRuntimeError,
   });
+
+  useAppUpdateRestartGuard(
+    actions.isCreating || actions.isResuming || actions.forkingMessageId || draft.isStarting
+      ? 'Waiting for the current chat or workflow action to finish.'
+      : composer.composerHasPayload
+        ? 'Send or clear your message draft before the update restarts SessionFlow.'
+        : draft.graph.nodeOrder.length > 0
+          ? 'Run or discard your workflow draft before the update restarts SessionFlow.'
+          : sessionComposerSettings.hasDrafts
+            ? 'Apply or revert your pending chat settings before the update restarts SessionFlow.'
+            : undefined,
+  );
 
   const canvas = useCanvas({
     runtimeApi,

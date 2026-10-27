@@ -20,6 +20,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { createEmptyGraphState } from '../../shared/graph-state.js'
+import { appUpdateRuntimeBlockers } from '../../shared/app-update.js'
 import { providerEnvKeyIsSensitive } from '../../shared/provider-setup.js'
 import { ContextChannelStore } from './contextChannel.js'
 import { ExternalIngestionService } from './external/externalIngestionService.js'
@@ -139,6 +140,10 @@ import {
 export class RuntimeSessionManager {
   #state: JsonRecord = createEmptyGraphState()
   #runs = new Map<string, RuntimeRun>()
+  #updatePrepared = false
+  #updatePrepareInFlight?: Promise<void>
+  #updateResumeRequested = false
+  #directProviderOperations = 0
   #runContext = new Map<string, JsonRecord>()
   #terminalService = new TerminalService({
     broadcast: (event) => this.#broadcast(event),
@@ -769,10 +774,12 @@ export class RuntimeSessionManager {
   // human (IPC/HTTP wrappers), master/agent (membrane), rule (loop automation)
   // -- converge in CommandExecutor.
   async dispatchCommand(command: JsonRecord = {}): Promise<any> {
+    if (this.#updatePrepared) throw new Error('SessionFlow is preparing to restart for an update. Try again after the update completes.')
     return this.#commandExecutor.dispatch(command)
   }
 
   #reviveDirectProviderRuntime() {
+    if (this.#updatePrepared) throw new Error('SessionFlow is preparing to restart for an update.')
     if (!this.#commandExecutor.currentTransaction()) {
       this.#sessionRuntime.resumeQueueDrain()
     }
@@ -791,6 +798,7 @@ export class RuntimeSessionManager {
   }
 
   #humanCtx() {
+    if (this.#updatePrepared) throw new Error('SessionFlow is preparing to restart for an update.')
     return { actor: { kind: 'human' } }
   }
 
@@ -874,6 +882,7 @@ export class RuntimeSessionManager {
 
   // Embedded terminal lifecycle lives in TerminalService (terminal/).
   createTerminal(input: JsonRecord = {}) {
+    if (this.#updatePrepared) throw new Error('SessionFlow is preparing to restart for an update.')
     return this.#terminalService.createTerminal(input)
   }
 
@@ -882,10 +891,12 @@ export class RuntimeSessionManager {
   }
 
   runTerminalCommand(input: JsonRecord = {}) {
+    if (this.#updatePrepared) throw new Error('SessionFlow is preparing to restart for an update.')
     return this.#terminalService.runTerminalCommand(input)
   }
 
   writeTerminalInput(input: JsonRecord = {}) {
+    if (this.#updatePrepared) throw new Error('SessionFlow is preparing to restart for an update.')
     return this.#terminalService.writeTerminalInput(input)
   }
 
@@ -986,7 +997,7 @@ export class RuntimeSessionManager {
   }
 
   async createSession(input: JsonRecord = {}) {
-    return this.#sessionCommands.createSession(input)
+    return this.#trackDirectProviderOperation(() => this.#sessionCommands.createSession(input))
   }
 
   #nativeSessionRequest(input: JsonRecord, requireSessionId: boolean) {
@@ -1063,7 +1074,7 @@ export class RuntimeSessionManager {
 
 
   async resumeSession(input: JsonRecord = {}) {
-    return this.#sessionCommands.resumeSession(input)
+    return this.#trackDirectProviderOperation(() => this.#sessionCommands.resumeSession(input))
   }
 
   deliverToSession(input: JsonRecord = {}) {
@@ -1071,7 +1082,7 @@ export class RuntimeSessionManager {
   }
 
   async activateSession(input: JsonRecord = {}) {
-    return this.#sessionCommands.activateSession(input)
+    return this.#trackDirectProviderOperation(() => this.#sessionCommands.activateSession(input))
   }
 
   // resume = deliver + activate (kernel doc §4.1). The external verb stays
@@ -1143,6 +1154,83 @@ export class RuntimeSessionManager {
     // same store, this connection's snapshot writes are dropped by the
     // snapshot-owner check instead of clobbering the newer state.
     return providerShutdown
+  }
+
+  #trackDirectProviderOperation<T>(run: () => Promise<T>): Promise<T> {
+    if (this.#updatePrepared) return Promise.reject(new Error('SessionFlow is preparing to restart for an update.'))
+    this.#directProviderOperations += 1
+    try { return Promise.resolve(run()).finally(() => { this.#directProviderOperations -= 1 }) }
+    catch (error) { this.#directProviderOperations -= 1; throw error }
+  }
+
+  getUpdateBlockers(): string[] {
+    const blockers = appUpdateRuntimeBlockers(this.getState())
+    if (this.#commandExecutor.pendingCommandCount() || this.#directProviderOperations) blockers.push('A runtime operation is still in progress')
+    if (this.#updatePrepareInFlight) blockers.push('An update save is still finishing')
+    if (this.#runs.size) blockers.push('A provider process is still active')
+    if (this.#terminalService.runningTerminalIds().length) blockers.push('An embedded terminal is still open')
+    if (this.#planCouncilInFlight.size || this.#goalLoopInFlight.size || this.#classicWorkflowInFlight.size) blockers.push('A workflow is being configured')
+    if (Object.values(this.#state.sources ?? {}).some((source: JsonRecord) => source.state === 'active' && source.kind === 'script')) blockers.push('A script event source is still running')
+    return [...new Set(blockers)]
+  }
+
+  async prepareForUpdate() {
+    if (this.#updatePrepareInFlight) return this.#updatePrepareInFlight
+    if (this.#updatePrepared) return
+    const blockers = this.getUpdateBlockers()
+    if (blockers.length) {
+      const error = new Error(`Waiting to update: ${blockers.join('; ')}.`) as Error & { code: string }
+      error.code = 'ORRERY_UPDATE_BUSY'
+      throw error
+    }
+    // Admission closes synchronously before any await. No existing task is
+    // killed: the live run map, commands, queue, workflows and terminals above
+    // must all be idle before these recoverable drains are suspended.
+    this.#updatePrepared = true
+    this.#updateResumeRequested = false
+    this.#collaboration.suspend()
+    this.#governance.suspendWakeupDrain()
+    this.#sessionRuntime.suspendQueueDrain()
+    this.#scheduler.clearAllTimers()
+    this.#governance.clearBarrierTimers()
+    this.#externalIngestion.suspendAdapters()
+    const preparation = this.#flushForUpdate()
+    this.#updatePrepareInFlight = preparation
+    return preparation
+  }
+
+  async #flushForUpdate() {
+    try {
+      await this.#providerService.closeAll()
+      if (this.#updateResumeRequested) throw Object.assign(new Error('The update preparation was cancelled.'), { code: 'ORRERY_UPDATE_CANCELLED' })
+      this.#persistState(true)
+    } catch (error) {
+      this.#updateResumeRequested = true
+      throw error
+    } finally {
+      this.#updatePrepareInFlight = undefined
+      if (this.#updateResumeRequested) {
+        try { this.#resumeAfterUpdateFailureNow() } catch (recoveryError) { console.error('Failed to resume runtime after an aborted update', recoveryError) }
+      }
+    }
+  }
+
+  resumeAfterUpdateFailure() {
+    if (!this.#updatePrepared) return
+    if (this.#updatePrepareInFlight) { this.#updateResumeRequested = true; return }
+    this.#resumeAfterUpdateFailureNow()
+  }
+
+  #resumeAfterUpdateFailureNow() {
+    this.#updatePrepared = false
+    this.#updateResumeRequested = false
+    this.#collaboration.resume()
+    this.#governance.resumeWakeupDrain()
+    this.#sessionRuntime.resumeQueueDrain()
+    this.#scheduler.recoverTimers()
+    this.#governance.recoverBarrierTimers()
+    this.#externalIngestion.resumeAdapters(this.#externalIngestion.adapterLifecycleEpoch())
+    queueMicrotask(() => this.#governance.drainWorkflowWakeups())
   }
 
   respondRuntimeRequest(input: JsonRecord = {}) {
@@ -1963,8 +2051,8 @@ export class RuntimeSessionManager {
     this.#commandExecutor.broadcast(event)
   }
 
-  #persistState() {
-    this.#commandExecutor.persistState()
+  #persistState(requireOwner = false) {
+    this.#commandExecutor.persistState({ requireOwner })
   }
 
   #kernelStoreDiagnostics() {
