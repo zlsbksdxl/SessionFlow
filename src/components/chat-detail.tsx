@@ -1,25 +1,34 @@
-import { ArrowUp, Braces, Paperclip, Square, TriangleAlert } from 'lucide-react';
+import { ArrowUp, PanelRightOpen, Square, TriangleAlert } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { cn } from '@/lib/utils';
 import { sessionDisplayLabel } from '@/lib/session-display';
 import { providerOption } from '@/lib/provider-catalog';
+import { projectIdForDraft } from '@/lib/draft-chat-project';
+import { computerConnectionId } from '@/lib/chat-computers';
 import { NewChatSetupBar } from '@/components/new-chat-setup';
 import { ChatOpenMenu } from '@/components/chat-open-menu';
 import { RecoveryNotice } from '@/components/recovery';
 import { SessionTerminalPanel } from '@/components/session-terminal-panel';
 import { LiveSessionTimeline } from '@/components/live-session-timeline';
+import { NewChatWelcome } from '@/components/new-chat-welcome';
+import { PaneHeader } from '@/components/pane-header';
+import { ChatProjectDialog } from '@/components/chat-project-dialog';
 import { RuntimeInteractionPanel } from '@/components/runtime-interaction-panel';
 import { LiveProviderEventDrawer } from '@/components/live-provider-event-drawer';
 import { ProviderSetupDiagnostics } from '@/components/provider-settings';
 import { ComposerAttachmentPill } from '@/components/composer-attachment-pill';
 import { ComposerModelControls } from '@/components/composer-model-controls';
-import { type Dispatch, type SetStateAction, useEffect, useState } from 'react';
-import { type ProviderSetupStatus } from '@/shared/graph-state';
+import { ComposerPermissionControls } from '@/components/composer-permission-controls';
+import { ComposerAddMenu } from '@/components/composer-add-menu';
+import { type Dispatch, type ReactNode, type SetStateAction, useEffect, useMemo, useState } from 'react';
+import { type AgentSession, type ProviderSetupStatus } from '@/shared/graph-state';
 import { type RuntimeCoreState } from '@/hooks/use-runtime-core';
 import { type LayoutPrefsState } from '@/hooks/use-layout-prefs';
 import { type ComposerState } from '@/hooks/use-composer';
-import { type NewChatSetupState } from '@/hooks/use-new-chat-setup';
+import { loadWorkspaceProviderSetupStatus, workspaceConnectionKey, type NewChatSetupState } from '@/hooks/use-new-chat-setup';
+import { useChatProjects } from '@/hooks/use-chat-projects';
+import type { SessionComposerSettingsState } from '@/hooks/use-session-composer-settings';
 import { type TerminalPanelState } from '@/hooks/use-terminal-panel';
 import { type SessionActionsState } from '@/hooks/use-session-actions';
 import { type InteractionsState } from '@/hooks/use-interactions';
@@ -28,6 +37,7 @@ import { providerSetupProfileFingerprint, selectProviderSetupProfile } from '@sh
 import { PlanCouncilCard } from '@/components/plan-council-card';
 import { WorkflowProposalCard } from '@/components/workflow-proposal-card';
 import { ThreadGoalProgressRow } from '@/components/thread-goal-progress-row';
+import type { ChatProjectConnection } from '@shared/chat-projects';
 
 const isMacPlatform = typeof navigator !== 'undefined' && /Mac/i.test(navigator.platform);
 
@@ -37,6 +47,8 @@ type ChatDetailProps = {
   core: RuntimeCoreState;
   layout: LayoutPrefsState;
   composer: ComposerState;
+  sessionComposerSettings: SessionComposerSettingsState;
+  headerNotices?: ReactNode;
   newChat: NewChatSetupState;
   terminal: TerminalPanelState;
   actions: SessionActionsState;
@@ -50,12 +62,15 @@ type ChatDetailProps = {
   setIsWorkspacePanelOpen: Dispatch<SetStateAction<boolean>>;
   onOpenPlanCouncil: (workflowId: string) => void;
   onOpenAgentSettings: () => void;
+  onShowOnGraph?: () => void;
 };
 
 export function ChatDetail({
   core,
   layout,
   composer,
+  sessionComposerSettings,
+  headerNotices,
   newChat,
   terminal,
   actions,
@@ -69,12 +84,12 @@ export function ChatDetail({
   setIsWorkspacePanelOpen,
   onOpenPlanCouncil,
   onOpenAgentSettings,
+  onShowOnGraph,
 }: ChatDetailProps) {
   const {
     runtimeClient,
     runtimeApi,
     isRuntimeAvailable,
-    isElectron,
     runtimeHostPlatform,
     runtimeStatusText,
     runtimeUnavailableText,
@@ -84,6 +99,7 @@ export function ChatDetail({
     setRuntimeState,
     setRuntimeError,
     selectedSession,
+    sessions,
     openRuntimeRequests,
     openUserInputRequests,
     providerInstances,
@@ -112,6 +128,7 @@ export function ChatDetail({
     composerEditorRef,
     composerFileInputRef,
     addComposerFiles,
+    addComposerChat,
     removeComposerAttachment,
     handleComposerPaste,
     handleComposerDrop,
@@ -121,7 +138,8 @@ export function ChatDetail({
     newProviderKind,
     newProviderInstanceId,
     newCwd,
-    setNewCwd,
+    newWorkspaceConnection,
+    newWorkspaceConnectionKey,
     newWorkMode,
     setNewWorkMode,
     newBranch,
@@ -134,24 +152,39 @@ export function ChatDetail({
     setNewReasoningEffort,
     providerSetupStatus,
     isLoadingProviderSetupStatus,
+    refreshProviderSetup,
     savingProviderInstanceId,
     providerInstanceError,
     changeNewProviderKind,
     newCwdValidation,
     newChatProjects,
-    chooseNewChatProject,
     saveProviderInstance,
   } = newChat;
   const providerSetupSession = selectedSession?.sessionId === providerSetupSessionId ? selectedSession : undefined;
   const providerSetupProviderKind = providerSetupSession?.providerKind;
   const providerSetupProviderInstanceId = providerSetupSession?.providerInstanceId;
   const providerSetupCwd = providerSetupSession?.cwd;
+  const providerSetupSshHost = providerSetupSession?.workspaceConnection?.kind === 'ssh' ? providerSetupSession.workspaceConnection.host : undefined;
+  const providerSetupSshRuntimePath =
+    providerSetupSession?.workspaceConnection?.kind === 'ssh' ? providerSetupSession.workspaceConnection.runtimePath : undefined;
+  const providerSetupWorkspaceConnection = useMemo<ChatProjectConnection | undefined>(
+    () =>
+      providerSetupSshHost && providerSetupSshRuntimePath ? { kind: 'ssh', host: providerSetupSshHost, runtimePath: providerSetupSshRuntimePath } : undefined,
+    [providerSetupSshHost, providerSetupSshRuntimePath],
+  );
+  const providerSetupWorkspaceKey = workspaceConnectionKey(providerSetupWorkspaceConnection);
   const providerSetupProfile = providerSetupProviderKind
     ? selectProviderSetupProfile(providerInstances, providerSetupProviderKind, providerSetupProviderInstanceId)
     : undefined;
   const providerSetupProfileKey = providerSetupProfileFingerprint(providerSetupProfile);
   const [selectedProviderSetupStatus, setSelectedProviderSetupStatus] = useState<ProviderSetupStatus>();
   const [isLoadingSelectedProviderSetup, setIsLoadingSelectedProviderSetup] = useState(false);
+  const [projectDialogConnectionKind, setProjectDialogConnectionKind] = useState<'local' | 'ssh'>();
+  const { createProjectWithDetails } = useChatProjects(runtimeApi, setRuntimeState);
+
+  useEffect(() => {
+    if (selectedSession?.sessionId) setProjectDialogConnectionKind(undefined);
+  }, [selectedSession?.sessionId]);
 
   useEffect(() => {
     if (providerSetupSessionId && selectedSession?.sessionId !== providerSetupSessionId) {
@@ -167,12 +200,14 @@ export function ChatDetail({
     }
     let cancelled = false;
     setIsLoadingSelectedProviderSetup(true);
-    runtimeApi
-      .getProviderSetupStatus({
-        providerKind: providerSetupProviderKind,
-        providerInstanceId: providerSetupProviderInstanceId,
-        cwd: providerSetupCwd,
-      })
+    loadWorkspaceProviderSetupStatus({
+      runtimeApi,
+      connection: providerSetupWorkspaceConnection,
+      providerKind: providerSetupProviderKind,
+      providerInstanceId: providerSetupProviderInstanceId,
+      profileFingerprint: providerSetupProfileKey,
+      cwd: providerSetupCwd ?? '',
+    })
       .then((status) => {
         if (!cancelled) setSelectedProviderSetupStatus(status);
       })
@@ -182,9 +217,10 @@ export function ChatDetail({
           providerKind: providerSetupProviderKind,
           providerInstanceId: providerSetupProviderInstanceId,
           generatedAt: new Date().toISOString(),
+          ...(providerSetupWorkspaceConnection?.kind === 'ssh' ? { readiness: 'unavailable' as const, auth: { status: 'unknown' as const } } : {}),
           checks: [
             {
-              id: 'setup-status',
+              id: providerSetupWorkspaceConnection?.kind === 'ssh' ? 'protocol' : 'setup-status',
               label: 'Setup status',
               status: 'error',
               message: error instanceof Error ? error.message : String(error),
@@ -198,7 +234,15 @@ export function ChatDetail({
     return () => {
       cancelled = true;
     };
-  }, [providerSetupCwd, providerSetupProfileKey, providerSetupProviderInstanceId, providerSetupProviderKind, runtimeApi]);
+  }, [
+    providerSetupCwd,
+    providerSetupProfileKey,
+    providerSetupProviderInstanceId,
+    providerSetupProviderKind,
+    providerSetupWorkspaceConnection,
+    providerSetupWorkspaceKey,
+    runtimeApi,
+  ]);
   const {
     isTerminalPanelOpen,
     isOpeningTerminal,
@@ -215,6 +259,11 @@ export function ChatDetail({
     isResuming,
     forkingMessageId,
     pendingLinkedSource,
+    newChatProjectId,
+    chatComputers,
+    selectNewChatComputer,
+    clearNewChatProject,
+    selectNewChatProject,
     openingWorkspaceTarget,
     composerDisabled,
     canOpenSelectedWorkspace,
@@ -228,6 +277,19 @@ export function ChatDetail({
   } = actions;
   const { userInputDrafts, setUserInputDraft, pendingInteractionIds, respondToRuntimeRequest, answerRuntimeUserInput } = interactions;
   const { openTurnDiff } = diff;
+  const welcomeProjectId = projectIdForDraft(runtimeState, newChatProjectId, newCwd.trim(), pendingLinkedSource?.sessionId);
+  const welcomeProjectName = welcomeProjectId ? runtimeState.chatProjects?.[welcomeProjectId]?.label : undefined;
+  const visibleWorkspaceConnection = selectedSession ? selectedSession.workspaceConnection : newWorkspaceConnection;
+  const remoteWorkspace = visibleWorkspaceConnection?.kind === 'ssh';
+  const remoteDiagnostics = remoteWorkspace && Boolean(providerSetupSession || showRawEvents);
+  const remoteSetupStatus = providerSetupSession ? selectedProviderSetupStatus : providerSetupStatus;
+  const sessionModelCatalog = selectedSession?.providerInstanceId ? runtimeState.providerModelCatalogs?.[selectedSession.providerInstanceId] : undefined;
+  const selectedModelCatalog =
+    !remoteWorkspace &&
+    sessionModelCatalog?.providerKind === selectedSession?.providerKind &&
+    sessionModelCatalog?.providerInstanceId === selectedSession?.providerInstanceId
+      ? sessionModelCatalog
+      : undefined;
   const providerBlockingCheck = !selectedSession
     ? providerSetupStatus?.checks.find((check) => check.status === 'error' && ['binary', 'auth', 'protocol'].includes(check.id))
     : undefined;
@@ -237,6 +299,7 @@ export function ChatDetail({
     providerSetupStatus.providerInstanceId === newProviderInstanceId &&
     providerSetupStatus.profileFingerprint ===
       providerSetupProfileFingerprint(selectProviderSetupProfile(providerInstances, newProviderKind, newProviderInstanceId)) &&
+    providerSetupStatus.workspaceConnectionKey === newWorkspaceConnectionKey &&
     providerSetupStatus.cwd === newCwd.trim(),
   );
   const newProviderBlocked = Boolean(
@@ -250,59 +313,87 @@ export function ChatDetail({
 
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-      <div className="@container shrink-0 border-b border-border bg-card px-3.5 py-2">
-        <div className="min-w-0">
-          <div className="flex min-w-0 items-center gap-2.5">
+      {projectDialogConnectionKind ? (
+        <ChatProjectDialog
+          key={projectDialogConnectionKind}
+          runtimeApi={runtimeApi}
+          movingChat={false}
+          connectionKind={projectDialogConnectionKind}
+          onClose={() => setProjectDialogConnectionKind(undefined)}
+          onSave={async (cwd, label, connection) => {
+            const project = await createProjectWithDetails(cwd, label, connection);
+            selectNewChatProject(project);
+            setProjectDialogConnectionKind(undefined);
+          }}
+        />
+      ) : null}
+      <div className="shrink-0">
+        <PaneHeader className="@container bg-card">
+          <div className="flex w-full min-w-0 items-center gap-2.5">
             <div className="flex min-w-0 flex-1 items-center gap-2">
-              <h2 className="min-w-0 flex-1 truncate text-[14px] font-semibold" title={selectedSession ? sessionDisplayLabel(selectedSession) : undefined}>
-                {selectedSession ? sessionDisplayLabel(selectedSession) : pendingLinkedSource ? 'New agent' : 'New chat'}
-              </h2>
+              {selectedSession || pendingLinkedSource ? (
+                <h2 className="min-w-0 flex-1 truncate text-[14px] font-semibold" title={selectedSession ? sessionDisplayLabel(selectedSession) : undefined}>
+                  {selectedSession ? sessionDisplayLabel(selectedSession) : 'New agent'}
+                </h2>
+              ) : null}
+              {visibleWorkspaceConnection?.kind === 'ssh' ? (
+                <span
+                  className="max-w-44 shrink truncate rounded-md bg-muted px-2 py-1 text-[10.5px] text-muted-foreground"
+                  title={`SSH · ${visibleWorkspaceConnection.host}:${selectedSession?.cwd ?? newCwd}`}
+                  aria-label={`SSH host ${visibleWorkspaceConnection.host}`}
+                >
+                  SSH · {visibleWorkspaceConnection.host}
+                </span>
+              ) : null}
             </div>
             <div className="flex shrink-0 items-center gap-1.5">
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    className="app-region-no-drag size-7"
-                    variant={showRawEvents || providerSetupSession ? 'secondary' : 'ghost'}
-                    size="icon"
-                    aria-label="Diagnostics"
-                    onClick={() => {
-                      if (providerSetupSession) {
-                        setProviderSetupSessionId(undefined);
-                      } else {
-                        setShowRawEvents((current) => !current);
-                      }
-                    }}
-                  >
-                    <Braces className="size-3.5" />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent>Diagnostics</TooltipContent>
-              </Tooltip>
-              {selectedSession || effectiveGraphCollapsed ? (
+              {selectedSession ? (
                 <ChatOpenMenu
-                  showSessionActions={Boolean(selectedSession)}
                   target={openWorkspaceTarget}
                   platform={runtimeHostPlatform}
                   canOpenWorkspace={canOpenSelectedWorkspace}
                   pendingTarget={openingWorkspaceTarget}
                   onTargetChange={setOpenWorkspaceTarget}
                   onOpenWorkspace={openSelectedWorkspace}
-                  canOpenWorkspaceFiles={Boolean(selectedSession?.cwd.trim())}
+                  canOpenWorkspaceFiles={Boolean(selectedSession?.cwd.trim()) && !remoteWorkspace}
                   isWorkspaceFilesOpen={isWorkspacePanelOpen}
                   onWorkspaceFilesOpenChange={setIsWorkspacePanelOpen}
-                  canOpenTerminal={canOpenSelectedTerminal}
+                  canOpenTerminal={canOpenSelectedTerminal && !remoteWorkspace}
                   isOpeningTerminal={isOpeningTerminal}
                   onOpenTerminal={openSelectedTerminal}
-                  onShowGraph={effectiveGraphCollapsed ? () => setGraphCollapsed(false) : undefined}
-                  graphUnavailable={graphForcedCollapsed}
+                  onShowOnGraph={onShowOnGraph}
+                  isDiagnosticsOpen={Boolean(showRawEvents || providerSetupSession)}
+                  onDiagnosticsOpenChange={(open) => {
+                    if (!open) setProviderSetupSessionId(undefined);
+                    setShowRawEvents(open);
+                  }}
                 />
+              ) : null}
+              {effectiveGraphCollapsed ? (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span className="inline-flex" tabIndex={graphForcedCollapsed ? 0 : undefined}>
+                      <Button
+                        className="app-region-no-drag size-7 text-muted-foreground"
+                        variant="ghost"
+                        size="icon-sm"
+                        aria-label="Show Agent graph"
+                        disabled={graphForcedCollapsed}
+                        onClick={() => setGraphCollapsed(false)}
+                      >
+                        <PanelRightOpen className="size-4" />
+                      </Button>
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent>{graphForcedCollapsed ? 'Widen the window to show the graph' : 'Show Agent graph'}</TooltipContent>
+                </Tooltip>
               ) : null}
             </div>
           </div>
-        </div>
+        </PaneHeader>
+        {headerNotices ? <div className="app-region-no-drag">{headerNotices}</div> : null}
         {selectedRecoveryState ? (
-          <div className="mt-2">
+          <div className="app-region-no-drag border-b border-border bg-card px-3.5 py-2">
             <RecoveryNotice state={selectedRecoveryState} compact />
           </div>
         ) : null}
@@ -319,7 +410,20 @@ export function ChatDetail({
           onAnswer={answerRuntimeUserInput}
         />
 
-        {providerSetupSession ? (
+        {remoteDiagnostics ? (
+          <div className="space-y-2 border-b border-border bg-card px-3.5 py-3 text-xs text-muted-foreground">
+            <p className="font-medium text-foreground">
+              SSH provider setup · {visibleWorkspaceConnection?.kind === 'ssh' ? visibleWorkspaceConnection.host : ''}
+            </p>
+            <p>Providers use the server’s own configuration and sign-in.</p>
+            {(providerSetupSession ? isLoadingSelectedProviderSetup : isLoadingProviderSetupStatus) ? <p>Checking SSH provider…</p> : null}
+            {remoteSetupStatus?.checks.map((check) => (
+              <p key={check.id} className={check.status === 'error' ? 'text-term-rose' : undefined}>
+                {check.label}: {check.message}
+              </p>
+            ))}
+          </div>
+        ) : providerSetupSession ? (
           <ProviderSetupDiagnostics
             isRuntimeAvailable={isRuntimeAvailable}
             runtimeStatusText={runtimeStatusText}
@@ -374,19 +478,23 @@ export function ChatDetail({
               onOpen={() => onOpenPlanCouncil(selectedPlanCouncil.workflowId)}
             />
           ) : null}
-          <LiveSessionTimeline
-            runtimeStateStore={runtimeStateStore}
-            sessionId={selectedSession?.sessionId}
-            session={selectedSession}
-            agent={selectedSession?.agent}
-            canActOnPlan={canActOnPlan}
-            onContinuePlan={continueRuntimePlan}
-            onRevisePlan={reviseRuntimePlan}
-            onOpenTurnDiff={openTurnDiff}
-            forkingMessageId={forkingMessageId}
-            canForkSession={isRuntimeAvailable}
-            onForkMessage={forkSessionFromMessage}
-          />
+          {selectedSession ? (
+            <LiveSessionTimeline
+              runtimeStateStore={runtimeStateStore}
+              sessionId={selectedSession.sessionId}
+              session={selectedSession}
+              agent={selectedSession.agent}
+              canActOnPlan={canActOnPlan}
+              onContinuePlan={continueRuntimePlan}
+              onRevisePlan={reviseRuntimePlan}
+              onOpenTurnDiff={openTurnDiff}
+              forkingMessageId={forkingMessageId}
+              canForkSession={isRuntimeAvailable}
+              onForkMessage={forkSessionFromMessage}
+            />
+          ) : (
+            <NewChatWelcome projectName={welcomeProjectName} />
+          )}
         </div>
 
         {isTerminalPanelOpen && selectedTerminal ? (
@@ -400,7 +508,7 @@ export function ChatDetail({
           />
         ) : null}
 
-        <div className="shrink-0 border-t border-border bg-card p-2.5">
+        <div className="min-w-0 shrink-0 bg-background px-3 pb-2.5 pt-3">
           {!selectedSession ? (
             <>
               {pendingLinkedSource ? (
@@ -426,27 +534,39 @@ export function ChatDetail({
                   <span className="min-w-0 flex-1">
                     {providerBlockingCheck?.message ?? `${providerOption(newProviderKind).label} needs setup before it can start a chat.`}
                   </span>
-                  <Button className="h-7 shrink-0 font-mono text-[10px] tracking-[0.07em]" variant="outline" size="sm" onClick={onOpenAgentSettings}>
-                    Agent settings
+                  <Button
+                    className="h-7 shrink-0 font-mono text-[10px] tracking-[0.07em]"
+                    variant="outline"
+                    size="sm"
+                    onClick={newWorkspaceConnection.kind === 'ssh' ? refreshProviderSetup : onOpenAgentSettings}
+                  >
+                    {newWorkspaceConnection.kind === 'ssh' ? 'Recheck SSH provider' : 'Agent settings'}
                   </Button>
                 </div>
               ) : null}
               <NewChatSetupBar
                 projects={newChatProjects}
                 projectCwd={newCwd}
+                computers={chatComputers}
+                computerId={computerConnectionId(newWorkspaceConnection)}
+                remoteHost={newWorkspaceConnection.kind === 'ssh' ? newWorkspaceConnection.host : undefined}
+                projectName={welcomeProjectName}
+                registeredProjects={Object.values(runtimeState.chatProjects ?? {})}
+                selectedProjectId={welcomeProjectId}
+                outsideProject={!welcomeProjectName}
                 validation={newCwdValidation}
                 providerKind={newProviderKind}
                 workMode={newWorkMode}
                 branch={newBranch}
-                runtimeMode={newRuntimeMode}
                 disabled={isCreating || !isRuntimeAvailable}
-                canChooseProject={isElectron}
-                onProjectChange={setNewCwd}
-                onChooseProject={chooseNewChatProject}
+                onNoProject={clearNewChatProject}
+                onSelectProject={selectNewChatProject}
+                onNewProject={() => setProjectDialogConnectionKind('local')}
+                onNewRemoteProject={() => setProjectDialogConnectionKind('ssh')}
+                onComputerChange={selectNewChatComputer}
                 onProviderKindChange={changeNewProviderKind}
                 onWorkModeChange={setNewWorkMode}
                 onBranchChange={setNewBranch}
-                onRuntimeModeChange={setNewRuntimeMode}
               />
             </>
           ) : null}
@@ -474,7 +594,7 @@ export function ChatDetail({
           />
           <div
             className={cn(
-              'app-region-no-drag @container mb-2 rounded-xl border border-ink-line bg-ink transition focus-within:border-term-accent-hi/55 focus-within:ring-1 focus-within:ring-term-accent-hi/25',
+              'app-region-no-drag @container relative mb-1 rounded-[24px] border border-border/70 bg-background shadow-sm shadow-black/[0.025] transition-[border-color,box-shadow,background-color] focus-within:border-ring/25 focus-within:ring-2 focus-within:ring-ring/10',
               isComposerDragActive && 'border-term-accent-hi/60 bg-term-accent/[0.05] ring-1 ring-term-accent-hi/25',
             )}
             onDragEnter={(event) => {
@@ -496,27 +616,21 @@ export function ChatDetail({
             onDrop={handleComposerDrop}
           >
             {composerAttachments.length > 0 ? (
-              <div className="grid gap-1.5 border-b border-ink-line-2 px-2.5 py-2">
+              <div className="grid gap-1.5 border-b border-border/50 px-3.5 py-3">
                 {composerAttachments.map((attachment) => (
                   <ComposerAttachmentPill key={attachment.id} attachment={attachment} disabled={composerDisabled} onRemove={removeComposerAttachment} />
                 ))}
               </div>
             ) : null}
-            <div className="flex cursor-text gap-2 px-3.5 pb-1 pt-3" onClick={() => composerEditorRef.current?.focus()}>
-              <span
-                className={cn('select-none font-mono text-[13px] leading-6 transition-colors', composerDisabled ? 'text-term-faint' : 'text-term-accent-hi')}
-                aria-hidden="true"
-              >
-                ❯
-              </span>
+            <div className="cursor-text px-4 pb-2 pt-3.5" onClick={() => composerEditorRef.current?.focus()}>
               <div
                 ref={composerEditorRef}
-                className="orrery-composer-editor max-h-40 min-h-6 w-full overflow-y-auto whitespace-pre-wrap break-words bg-transparent font-mono text-[13px] leading-6 text-term-name outline-none"
+                className="orrery-composer-editor max-h-40 min-h-12 w-full overflow-y-auto whitespace-pre-wrap break-words bg-transparent font-sans text-sm leading-6 text-foreground outline-none"
                 role="textbox"
                 aria-multiline="true"
                 aria-disabled={composerDisabled}
                 contentEditable={!composerDisabled}
-                data-placeholder={selectedSession ? 'Message this chat' : pendingLinkedSource ? 'Describe what this agent should do' : 'Start a new chat'}
+                data-placeholder={selectedSession ? 'Message this chat' : pendingLinkedSource ? 'Describe what this agent should do' : 'Do anything'}
                 suppressContentEditableWarning
                 onInput={(event) => setMessage(event.currentTarget.innerText)}
                 onPaste={handleComposerPaste}
@@ -528,38 +642,47 @@ export function ChatDetail({
                 }}
               />
             </div>
-            <div className="flex items-center gap-1 px-2 pb-2 pt-1">
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    className="size-8 shrink-0 text-term-dim hover:text-term-name"
-                    variant="ghost"
-                    size="icon-sm"
-                    disabled={composerDisabled}
-                    aria-label="Attach files"
-                    onClick={() => composerFileInputRef.current?.click()}
-                  >
-                    <Paperclip className="size-4" />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent>Attach files — or drag and drop, or paste</TooltipContent>
-              </Tooltip>
+            <div className="flex items-center gap-1 px-3 pb-2.5 pt-0.5">
+              <ComposerAddMenu
+                disabled={composerDisabled}
+                sessions={sessions}
+                currentSessionId={selectedSession?.sessionId}
+                attachmentIds={composerAttachments.map((attachment) => attachment.id)}
+                onAddFiles={() => composerFileInputRef.current?.click()}
+                onAddChat={(session) => {
+                  const latest = runtimeStateStore.getSessionView(session.sessionId)?.session as AgentSession | undefined;
+                  addComposerChat(latest ?? session);
+                }}
+              />
+              <ComposerPermissionControls
+                key={`permissions:${selectedSession?.sessionId ?? 'new-chat'}`}
+                providerKind={selectedSession ? sessionComposerSettings.providerKind : newProviderKind}
+                runtimeMode={selectedSession ? sessionComposerSettings.runtimeMode : newRuntimeMode}
+                disabled={composerDisabled}
+                onRuntimeModeChange={selectedSession ? sessionComposerSettings.setRuntimeMode : setNewRuntimeMode}
+              />
               <div className="ml-auto flex min-w-0 items-center gap-2">
                 {composerHasPayload && !canKill ? (
                   <span className="hidden font-mono text-[10px] text-term-faint @[26rem]:inline">{sendShortcutHint}</span>
                 ) : null}
-                {!selectedSession ? (
-                  <ComposerModelControls
-                    providerKind={newProviderKind}
-                    model={newModel}
-                    reasoningEffort={newReasoningEffort}
-                    discoveredModels={providerSetupStatus?.models?.availableModels}
-                    currentModelId={providerSetupStatus?.models?.currentModelId}
-                    disabled={isCreating || !isRuntimeAvailable}
-                    onModelChange={setNewModel}
-                    onReasoningEffortChange={setNewReasoningEffort}
-                  />
-                ) : null}
+                <ComposerModelControls
+                  key={`model:${selectedSession?.sessionId ?? 'new-chat'}`}
+                  providerKind={selectedSession ? sessionComposerSettings.providerKind : newProviderKind}
+                  model={selectedSession ? sessionComposerSettings.model : newModel}
+                  reasoningEffort={selectedSession ? sessionComposerSettings.reasoningEffort : newReasoningEffort}
+                  discoveredModels={
+                    remoteWorkspace ? [] : selectedSession ? selectedModelCatalog?.availableModels : providerSetupStatus?.models?.availableModels
+                  }
+                  currentModelId={
+                    selectedSession
+                      ? (selectedSession.effectiveRuntimeConfig?.model ?? selectedModelCatalog?.currentModelId)
+                      : providerSetupStatus?.models?.currentModelId
+                  }
+                  disabled={composerDisabled}
+                  normalizeReasoningEffort={!selectedSession}
+                  onModelChange={selectedSession ? sessionComposerSettings.setModel : setNewModel}
+                  onReasoningEffortChange={selectedSession ? sessionComposerSettings.setReasoningEffort : setNewReasoningEffort}
+                />
                 {canKill ? (
                   <Tooltip>
                     <TooltipTrigger asChild>
@@ -601,6 +724,9 @@ export function ChatDetail({
               </div>
             </div>
           </div>
+          {selectedSession && sessionComposerSettings.runtimeSettingsPatch ? (
+            <p className="px-1 text-[11px] text-muted-foreground">Settings changes apply to your next message.</p>
+          ) : null}
         </div>
       </div>
     </div>

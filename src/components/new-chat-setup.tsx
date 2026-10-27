@@ -1,14 +1,18 @@
-import { useEffect, useState } from 'react';
-import { Bot, Check, ChevronDown, ClipboardCheck, FolderOpen, GitBranch, RefreshCw, Sparkles, Terminal, TriangleAlert, type LucideIcon } from 'lucide-react';
-import { DropdownMenu as DropdownMenuPrimitive, Select as SelectPrimitive } from 'radix-ui';
+import { useEffect, useRef, useState } from 'react';
+import { Bot, Check, ChevronDown, FolderOpen, GitBranch, RefreshCw, Settings, Sparkles, TriangleAlert, X, type LucideIcon } from 'lucide-react';
+import { DropdownMenu as DropdownMenuPrimitive, Popover, Select as SelectPrimitive } from 'radix-ui';
 import { Button } from '@/components/ui/button';
+import { ComposerProjectPicker } from '@/components/composer-project-picker';
+import { ComposerComputerPicker } from '@/components/composer-computer-picker';
+import type { ChatComputerOption } from '@/lib/chat-computers';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { cn } from '@/lib/utils';
 import { type OpenWorkspaceTarget, type WorkMode } from '@/shared/graph-state';
-import { type ProviderKind, type ProviderRuntimeMode, providerCapability, providerRuntimeModeCapability } from '@/shared/provider-runtime';
+import type { ChatProject } from '@shared/chat-projects';
+import { type ProviderKind } from '@/shared/provider-runtime';
 import { workspaceOpenTargetOptions, workspaceOpenTargetOption, workspaceOpenTargetAvailable } from '@/lib/layout-prefs';
 import { providerOptions, modelOptionsForKind, workModeOptions } from '@/lib/provider-catalog';
-import { type ProjectCwdValidation, type NewChatProjectOption, chooseProjectOptionValue, uniqueStrings } from '@/lib/workspace';
+import { type ProjectCwdValidation, type NewChatProjectOption, projectNameFromCwd, uniqueStrings } from '@/lib/workspace';
 
 export function ProviderSegmentedControl({
   value,
@@ -150,7 +154,7 @@ export function NewChatSetupPill({
   value: string;
   options: SetupOption[];
   placeholder?: string;
-  tone?: 'primary' | 'secondary';
+  tone?: 'primary' | 'secondary' | 'context';
   disabled?: boolean;
   invalid?: boolean;
   hint?: string;
@@ -158,6 +162,7 @@ export function NewChatSetupPill({
   onChange: (value: string) => void;
 }) {
   const primary = tone === 'primary';
+  const context = tone === 'context';
   const display = options.find((option) => option.value === value)?.label ?? placeholder ?? label;
   return (
     <SelectPrimitive.Root value={value} disabled={disabled} onValueChange={onChange}>
@@ -165,19 +170,39 @@ export function NewChatSetupPill({
         aria-label={label}
         title={hint ?? label}
         className={cn(
-          'group relative flex h-7 min-w-0 shrink-0 items-center gap-1.5 rounded-md font-mono outline-none transition disabled:cursor-not-allowed disabled:opacity-55',
-          primary
-            ? 'border border-ink-line bg-ink pl-2 pr-1.5 hover:border-ink-line-2 data-[state=open]:border-term-accent-hi/60 focus-visible:border-term-accent-hi/60 focus-visible:ring-1 focus-visible:ring-term-accent-hi/25'
-            : 'border border-transparent px-1.5 hover:bg-white/[0.05] data-[state=open]:bg-white/[0.05] focus-visible:bg-white/[0.05]',
+          'group relative flex h-7 min-w-0 shrink-0 items-center gap-1.5 rounded-md outline-none transition disabled:cursor-not-allowed disabled:opacity-55',
+          context
+            ? 'h-8 px-2 font-sans hover:bg-foreground/[0.04] data-[state=open]:bg-foreground/[0.04] focus-visible:ring-2 focus-visible:ring-ring/30'
+            : 'font-mono',
+          !context &&
+            (primary
+              ? 'border border-ink-line bg-ink pl-2 pr-1.5 hover:border-ink-line-2 data-[state=open]:border-term-accent-hi/60 focus-visible:border-term-accent-hi/60 focus-visible:ring-1 focus-visible:ring-term-accent-hi/25'
+              : 'border border-transparent px-1.5 hover:bg-white/[0.05] data-[state=open]:bg-white/[0.05] focus-visible:bg-white/[0.05]'),
           invalid && 'border-term-rose/55 data-[state=open]:border-term-rose/70 focus-visible:border-term-rose/70 focus-visible:ring-term-rose/25',
           className,
         )}
       >
-        <Icon className={cn('size-3.5 shrink-0', invalid ? 'text-term-rose' : primary ? 'text-term-accent-hi' : 'text-term-dim2')} />
-        <span className={cn('min-w-0 flex-1 truncate text-left text-[11.5px]', primary ? 'font-medium text-term-name' : 'text-term-dim')}>{display}</span>
+        <Icon
+          className={cn('size-3.5 shrink-0', invalid ? 'text-term-rose' : context ? 'text-foreground/70' : primary ? 'text-term-accent-hi' : 'text-term-dim2')}
+        />
+        <span
+          className={cn(
+            'min-w-0 flex-1 truncate text-left',
+            context ? 'text-xs text-foreground/85' : primary ? 'text-[11.5px] font-medium text-term-name' : 'text-[11.5px] text-term-dim',
+          )}
+        >
+          {display}
+        </span>
         <SelectPrimitive.Icon asChild>
           <ChevronDown
-            className={cn('size-3 shrink-0 transition-transform group-data-[state=open]:rotate-180', primary ? 'text-term-dim2' : 'text-term-faint')}
+            className={cn(
+              'size-3 shrink-0 transition-[opacity,transform] group-data-[state=open]:rotate-180',
+              context
+                ? 'text-muted-foreground opacity-0 group-hover:opacity-100 group-focus-visible:opacity-100 group-data-[state=open]:opacity-100'
+                : primary
+                  ? 'text-term-dim2'
+                  : 'text-term-faint',
+            )}
           />
         </SelectPrimitive.Icon>
       </SelectPrimitive.Trigger>
@@ -187,7 +212,13 @@ export function NewChatSetupPill({
           side="top"
           align="start"
           sideOffset={6}
-          className="z-50 max-h-72 min-w-[var(--radix-select-trigger-width)] overflow-hidden rounded-lg border border-ink-line bg-ink-soft p-1 font-mono shadow-[0_12px_32px_-8px_rgba(0,0,0,0.75)]"
+          collisionPadding={12}
+          className={cn(
+            'app-region-no-drag z-50 max-h-[min(18rem,var(--radix-select-content-available-height))] min-w-[var(--radix-select-trigger-width)] max-w-[calc(100vw-24px)] overflow-hidden rounded-lg border p-1',
+            context
+              ? 'border-border/60 bg-popover font-sans text-popover-foreground shadow-lg'
+              : 'border-ink-line bg-ink-soft font-mono shadow-[0_12px_32px_-8px_rgba(0,0,0,0.75)]',
+          )}
         >
           <SelectPrimitive.Viewport className="flex flex-col gap-0.5">
             {options.map((option) => (
@@ -195,11 +226,16 @@ export function NewChatSetupPill({
                 key={option.value}
                 value={option.value}
                 disabled={option.disabled}
-                className="relative flex h-7 cursor-pointer select-none items-center gap-2 rounded-md pl-2.5 pr-7 text-[11.5px] text-term-dim outline-none data-[highlighted]:bg-white/[0.06] data-[highlighted]:text-term-name data-[state=checked]:bg-term-accent-hi/10 data-[state=checked]:font-medium data-[state=checked]:text-term-name data-[disabled]:pointer-events-none data-[disabled]:opacity-35"
+                className={cn(
+                  'relative flex h-8 cursor-pointer select-none items-center gap-2 rounded-md pl-2.5 pr-7 text-xs outline-none data-[disabled]:pointer-events-none data-[disabled]:opacity-35',
+                  context
+                    ? 'text-popover-foreground data-[highlighted]:bg-muted data-[state=checked]:font-medium'
+                    : 'h-7 text-[11.5px] text-term-dim data-[highlighted]:bg-white/[0.06] data-[highlighted]:text-term-name data-[state=checked]:bg-term-accent-hi/10 data-[state=checked]:font-medium data-[state=checked]:text-term-name',
+                )}
               >
                 <SelectPrimitive.ItemText>{option.label}</SelectPrimitive.ItemText>
                 <SelectPrimitive.ItemIndicator className="absolute right-2 inline-flex">
-                  <Check className="size-3.5 text-term-accent-hi" />
+                  <Check className={cn('size-3.5', !context && 'text-term-accent-hi')} />
                 </SelectPrimitive.ItemIndicator>
               </SelectPrimitive.Item>
             ))}
@@ -372,35 +408,49 @@ export function ModelPickerPill({
 export function NewChatSetupBar({
   projects,
   projectCwd,
+  computers,
+  computerId,
+  remoteHost,
+  outsideProject,
+  projectName,
+  registeredProjects = [],
+  selectedProjectId,
   validation,
   providerKind,
   workMode,
   branch,
-  runtimeMode,
   disabled,
-  canChooseProject,
-  onProjectChange,
-  onChooseProject,
+  onNoProject,
+  onSelectProject,
+  onNewProject,
+  onNewRemoteProject,
+  onComputerChange,
   onProviderKindChange,
   onWorkModeChange,
   onBranchChange,
-  onRuntimeModeChange,
 }: {
   projects: NewChatProjectOption[];
   projectCwd: string;
+  computers: ChatComputerOption[];
+  computerId: string;
+  remoteHost?: string;
+  outsideProject: boolean;
+  projectName?: string;
+  registeredProjects?: ChatProject[];
+  selectedProjectId?: string;
   validation: ProjectCwdValidation;
   providerKind: ProviderKind;
   workMode: WorkMode;
   branch: string;
-  runtimeMode: ProviderRuntimeMode;
   disabled?: boolean;
-  canChooseProject?: boolean;
-  onProjectChange: (cwd: string) => void;
-  onChooseProject: () => void;
+  onNoProject: () => void;
+  onSelectProject: (project: ChatProject) => void;
+  onNewProject: () => void;
+  onNewRemoteProject: () => void;
+  onComputerChange: (computerId: string) => void;
   onProviderKindChange: (providerKind: ProviderKind) => void;
   onWorkModeChange: (workMode: WorkMode) => void;
   onBranchChange: (branch: string) => void;
-  onRuntimeModeChange: (runtimeMode: ProviderRuntimeMode) => void;
 }) {
   const selectedProject = projects.find((project) => project.cwd === projectCwd.trim()) ?? projects[0];
   const branchOptions = uniqueStrings([selectedProject?.currentBranch, ...(selectedProject?.branches ?? [])]);
@@ -410,118 +460,171 @@ export function NewChatSetupBar({
   const branchValue = workMode === 'worktree' ? worktreeBranchValue : localBranchValue;
   const isKnownNonGitProject = selectedProject?.isGitRepo === false;
   const canPickBranch = workMode === 'worktree' && branchOptions.length > 0;
-  const providerRuntimeModes = providerCapability(providerKind).runtimeModes;
+
+  const projectChipRef = useRef<HTMLDivElement>(null);
+  const selectedProjectName = outsideProject
+    ? 'Choose project'
+    : (projectName ??
+      projects.find((project) => project.cwd === projectCwd.trim())?.name ??
+      (projectCwd.trim() ? projectNameFromCwd(projectCwd) : 'Choose project'));
+  const projectHint = outsideProject
+    ? 'Choose a project for this chat'
+    : validation.ok
+      ? remoteHost
+        ? `${remoteHost}:${projectCwd}`
+        : projectCwd
+      : validation.message;
+  const changeWorkMode = (value: string) => {
+    const nextMode = value === 'worktree' ? 'worktree' : 'local';
+    onWorkModeChange(nextMode);
+    if (nextMode === 'local') onBranchChange('');
+  };
+  const workOptions = workModeOptions.map((option) => ({
+    value: option.id,
+    label: option.id === 'local' ? 'Current folder' : 'Worktree',
+    disabled: option.id === 'worktree' && (isKnownNonGitProject || Boolean(remoteHost)),
+  }));
+  const settingsFieldClass = 'grid min-w-0 gap-1.5';
+  const settingsSelectClass = 'w-full bg-muted/55';
 
   return (
-    <div className="app-region-no-drag mb-2">
-      <div className="orrery-chip-row flex flex-nowrap items-center gap-1.5 overflow-x-auto py-1">
-        {canChooseProject ? (
-          <NewChatSetupPill
-            icon={FolderOpen}
-            label="Project"
-            value={selectedProject?.cwd ?? ''}
-            placeholder="Choose project"
-            options={[
-              ...projects.map((project) => ({
-                value: project.cwd,
-                label: project.name,
-              })),
-              { value: chooseProjectOptionValue, label: 'Choose project…' },
-            ]}
-            disabled={disabled}
-            invalid={!validation.ok}
-            hint={validation.ok ? 'Project' : validation.message}
-            className="max-w-[12rem] shrink-0"
-            onChange={(nextCwd) => {
-              if (nextCwd === chooseProjectOptionValue) {
-                onChooseProject();
-                return;
-              }
-              onProjectChange(nextCwd);
-              onBranchChange('');
-            }}
-          />
-        ) : (
-          <ProjectCwdChip
-            value={projectCwd}
-            validation={validation}
-            projects={projects}
-            disabled={disabled}
-            onChange={(nextCwd) => {
-              onProjectChange(nextCwd);
-              onBranchChange('');
-            }}
-          />
-        )}
-
-        <NewChatSetupPill
-          icon={Sparkles}
-          label="Agent"
-          hint="Agent runtime"
-          value={providerKind}
-          options={providerOptions.map((option) => ({
-            value: option.id,
-            label: option.label,
-          }))}
+    <div
+      role="toolbar"
+      aria-label="Chat context"
+      className="app-region-no-drag relative mx-3 -mb-3 flex min-w-0 items-center gap-1 rounded-t-[18px] bg-muted/55 px-2 pb-4 pt-1"
+    >
+      <div ref={projectChipRef} className="group/project relative flex min-w-0 max-w-[48%] shrink items-center rounded-md">
+        <ComposerProjectPicker
+          projects={registeredProjects}
+          selectedProjectId={selectedProjectId}
           disabled={disabled}
-          className="w-36"
-          onChange={(next) => {
-            onProviderKindChange(next as ProviderKind);
-          }}
-        />
-
-        <NewChatSetupPill
-          icon={Terminal}
-          label="Work"
-          value={workMode}
-          tone="secondary"
-          options={workModeOptions.map((option) => ({
-            value: option.id,
-            label: option.label,
-            disabled: option.id === 'worktree' && isKnownNonGitProject,
-          }))}
-          disabled={disabled}
-          className="shrink-0"
-          onChange={(nextWorkMode) => {
-            const normalized = nextWorkMode === 'worktree' ? 'worktree' : 'local';
-            onWorkModeChange(normalized);
-            if (normalized === 'local') {
-              onBranchChange('');
-            }
-          }}
-        />
-
-        <NewChatSetupPill
-          icon={GitBranch}
-          label="Branch"
-          value={branchValue}
-          placeholder="Branch"
-          tone="secondary"
-          options={branchOptions.map((option) => ({
-            value: option,
-            label: option,
-          }))}
-          disabled={disabled || !canPickBranch}
-          className="max-w-[10rem] shrink-0"
-          onChange={onBranchChange}
-        />
-
-        {providerRuntimeModes.length > 0 ? (
-          <NewChatSetupPill
-            icon={ClipboardCheck}
-            label="Mode"
-            value={providerRuntimeModeCapability(providerKind, runtimeMode) ? runtimeMode : providerRuntimeModes[0]?.id}
-            tone="secondary"
-            options={providerRuntimeModes.map((option) => ({
-              value: option.id,
-              label: option.label,
-            }))}
+          onSelectProject={onSelectProject}
+          onNewProject={onNewProject}
+          onNewRemoteProject={onNewRemoteProject}
+          onClearProject={onNoProject}
+        >
+          <button
+            type="button"
             disabled={disabled}
-            className="shrink-0"
-            onChange={(nextRuntimeMode) => onRuntimeModeChange(nextRuntimeMode as ProviderRuntimeMode)}
-          />
+            aria-label={outsideProject ? 'Choose project' : 'Project'}
+            title={projectHint}
+            className={cn(
+              'group flex h-8 min-w-0 items-center gap-1.5 rounded-md px-2 text-xs outline-none transition hover:bg-foreground/[0.04] focus-visible:ring-2 focus-visible:ring-ring/30 disabled:cursor-not-allowed disabled:opacity-55',
+              !outsideProject &&
+                'group-hover/project:[&>svg:first-child]:opacity-0 group-has-[[data-project-remove]:focus-visible]/project:[&>svg:first-child]:opacity-0',
+              outsideProject ? 'text-muted-foreground' : validation.ok ? 'text-foreground/85' : 'text-term-rose',
+            )}
+          >
+            <FolderOpen className="size-3.5 shrink-0" />
+            <span className="truncate">{selectedProjectName}</span>
+            {!outsideProject ? (
+              <ChevronDown className="size-3 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100 group-data-[state=open]:opacity-100" />
+            ) : null}
+          </button>
+        </ComposerProjectPicker>
+        {!outsideProject ? (
+          <button
+            type="button"
+            aria-label="Remove project from this chat"
+            data-project-remove=""
+            title="Remove project from this chat"
+            disabled={disabled}
+            className="pointer-events-none absolute left-1 top-1/2 inline-flex size-6 -translate-y-1/2 items-center justify-center rounded-full text-muted-foreground opacity-0 transition hover:bg-foreground/10 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40 disabled:cursor-not-allowed disabled:text-muted-foreground/40 group-hover/project:pointer-events-auto group-hover/project:opacity-100 focus-visible:pointer-events-auto focus-visible:opacity-100"
+            onPointerDown={(event) => event.stopPropagation()}
+            onClick={(event) => {
+              event.stopPropagation();
+              onNoProject();
+              requestAnimationFrame(() => projectChipRef.current?.querySelector('button')?.focus());
+            }}
+          >
+            <X className="size-3.5" aria-hidden="true" />
+          </button>
         ) : null}
       </div>
+
+      <NewChatSetupPill
+        icon={Sparkles}
+        label="Agent"
+        hint="Choose an agent"
+        value={providerKind}
+        tone="context"
+        options={providerOptions.map((option) => ({ value: option.id, label: option.label }))}
+        disabled={disabled}
+        className="min-w-0 shrink"
+        onChange={(next) => onProviderKindChange(next as ProviderKind)}
+      />
+
+      <Popover.Root>
+        <Popover.Trigger asChild>
+          <button
+            type="button"
+            disabled={disabled}
+            aria-label="Chat settings"
+            title={`Chat settings · ${providerOptions.find((option) => option.id === providerKind)?.label ?? providerKind}`}
+            className="ml-auto inline-flex size-8 shrink-0 items-center justify-center rounded-md text-muted-foreground outline-none transition hover:bg-foreground/[0.04] hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/30 disabled:cursor-not-allowed disabled:opacity-55"
+          >
+            <Settings className="size-3.5" />
+          </button>
+        </Popover.Trigger>
+        <Popover.Portal>
+          <Popover.Content
+            side="top"
+            align="end"
+            sideOffset={8}
+            collisionPadding={12}
+            aria-label="Chat settings"
+            className="app-region-no-drag z-50 w-72 max-w-[calc(100vw-24px)] rounded-2xl border border-border/60 bg-popover p-4 text-popover-foreground shadow-lg outline-none"
+          >
+            <h3 className="mb-3 text-sm font-semibold">Chat settings</h3>
+            <div className="grid gap-3">
+              <div className={settingsFieldClass}>
+                <span className="text-xs text-muted-foreground">Computer</span>
+                <ComposerComputerPicker
+                  computers={computers}
+                  value={computerId}
+                  disabled={disabled}
+                  onChange={onComputerChange}
+                  onNewRemoteProject={onNewRemoteProject}
+                />
+              </div>
+              {!remoteHost ? (
+                <div className={settingsFieldClass}>
+                  <span className="text-xs text-muted-foreground">Work mode</span>
+                  <NewChatSetupPill
+                    icon={workMode === 'worktree' ? GitBranch : FolderOpen}
+                    label="Work mode"
+                    value={workMode}
+                    tone="context"
+                    options={workOptions}
+                    disabled={disabled}
+                    className={settingsSelectClass}
+                    onChange={changeWorkMode}
+                  />
+                </div>
+              ) : null}
+              {!remoteHost && branchOptions.length > 0 ? (
+                <div className={settingsFieldClass}>
+                  <span className="text-xs text-muted-foreground">{canPickBranch ? 'Base branch' : 'Current branch'}</span>
+                  <NewChatSetupPill
+                    icon={GitBranch}
+                    label="Branch"
+                    value={branchValue}
+                    placeholder="Branch"
+                    tone="context"
+                    options={branchOptions.map((option) => ({ value: option, label: option }))}
+                    disabled={disabled || !canPickBranch}
+                    className={settingsSelectClass}
+                    onChange={onBranchChange}
+                  />
+                </div>
+              ) : null}
+              <p className="break-words text-[11px] leading-4 text-muted-foreground" title={remoteHost ? `${remoteHost}:${projectCwd}` : projectCwd}>
+                {projectCwd ? (remoteHost ? `${remoteHost}:${projectCwd}` : projectCwd) : 'No working folder selected'}
+              </p>
+            </div>
+          </Popover.Content>
+        </Popover.Portal>
+      </Popover.Root>
     </div>
   );
 }

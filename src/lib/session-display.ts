@@ -84,7 +84,7 @@ export const defaultSessionLabelPattern = /^(?:new chat|chat|claude|codex)\s*\d*
 
 export function sessionDisplayLabel(session: AgentSession) {
   const label = session.label.trim();
-  if (!defaultSessionLabelPattern.test(label)) {
+  if (session.labelIsCustom || !defaultSessionLabelPattern.test(label)) {
     return label;
   }
   const firstUserMessage = session.messages.find((message) => message.role === 'user' && message.content.trim().length > 0);

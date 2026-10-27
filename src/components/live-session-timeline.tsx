@@ -40,10 +40,6 @@ export const LiveSessionTimeline = memo(function LiveSessionTimeline({
 
   return (
     <>
-      <div className="sticky top-0 z-10 flex items-center gap-2.5 border-b border-ink-line-2 bg-ink px-4 py-2.5">
-        <span className="font-mono text-[10px] tracking-[0.16em] text-term-dim2">Timeline</span>
-        <span className="ml-auto font-mono text-[10.5px] tabular-nums text-term-faint">{timeline.length} entries</span>
-      </div>
       {timeline.length ? (
         <SessionTimeline
           entries={timeline}

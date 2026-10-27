@@ -41,6 +41,12 @@ export class WorkspaceService {
 
   async openWorkspace(input: JsonRecord = {}) {
     const request = isObject(input) ? input : {}
+    const state = this.#host.readState()
+    if (request.workspaceConnection?.kind === 'ssh' ||
+        (request.sessionId && state.sessions[request.sessionId]?.workspaceConnection?.kind === 'ssh') ||
+        (!request.sessionId && request.workspaceConnection?.kind !== 'local' && Object.values(state.chatProjects ?? {}).some((project: JsonRecord) => project.cwd === request.cwd && project.connection?.kind === 'ssh'))) {
+      throw new Error('Opening an SSH workspace in a local application is unavailable. Open the directory on its remote host.')
+    }
     const cwd = validateRunnableCwd(request.cwd)
     const target = normalizeOpenWorkspaceTarget(request.target ?? 'vscode')
     const { command, args } = workspaceOpenCommand(target, cwd)
@@ -96,6 +102,7 @@ export class WorkspaceService {
     }
 
     const session = state.sessions[sessionId]
+    if (session.workspaceConnection?.kind === 'ssh') throw new Error('Local file browsing is unavailable for SSH chats. The remote provider can inspect remote files.')
     const cwd = validateRunnableCwd(session.cwd)
     const countState = { totalFiles: 0, truncated: false }
     countWorkspaceFiles(cwd, countState)
@@ -142,6 +149,7 @@ export class WorkspaceService {
     }
 
     const session = state.sessions[sessionId]
+    if (session.workspaceConnection?.kind === 'ssh') throw new Error('Local file reads are unavailable for SSH chats. The remote provider can inspect remote files.')
     const cwd = validateRunnableCwd(session.cwd)
     const { absolutePath, relativePath } = resolveWorkspaceFilePath(
       cwd,

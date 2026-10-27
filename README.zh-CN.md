@@ -36,7 +36,9 @@ Agent 铺在一张画布上，Agent 之间可以连线——这些线不是示�
 对应的图；生成之后可以随意编辑。想自己设计 loop 的重度用户也一样轻：用对话把
 你要的结构说出来就行，不用在图纸上一笔一笔画。
 
-<img width="3202" height="1518" alt="SessionFlow-2" src="https://github.com/user-attachments/assets/cf02610e-0c44-4a1b-91cf-cb23a1a9d2b8" />
+<img width="1440" alt="SessionFlow 当前欢迎界面，包含项目导航与新聊天输入框" src="./docs/images/sessionflow-workspace.jpg" />
+
+这些截图展示当前界面，工作流图使用示例会话数据。
 
 一个常用玩法是多方案讨论：把同一个问题同时抛给几个模型——比如 Codex、Claude
 Code、Grok Build 各开一个 Agent，各自独立生成方案，然后互相阅读、互相挑战，
@@ -111,7 +113,7 @@ prompt 表达。graph 提供的是围绕它们的、可复用的控制语义：
 一个 Agent 实现变更，另一个 Agent 做 Code Review 并返回 blocking issues。
 review 结论会重新激活原来的会话，由它修复后再送回下一轮 review。
 
-<img width="3840" height="1986" alt="SessionFlow-review" src="https://github.com/user-attachments/assets/3af4c02e-aa7b-435c-b2e9-98997bae88d8" />
+<img width="1440" alt="SessionFlow 审查工作流，包含 Coder、Reviewer 和上限为六轮的审查环" src="./docs/images/sessionflow-review.jpg" />
 
 loop 只在 reviewer 报告 clean 或触到配置的护栏时停止。每一圈、每个 verdict、
 每条打回路径都留在图上。
@@ -121,7 +123,7 @@ loop 只在 reviewer 报告 clean 或触到配置的护栏时停止。每一圈�
 让几个 Agent 或模型作为独立规划者各自出方案，互相阅读、互相挑战，最后综合出
 最强的结果。
 
-<img width="3140" height="1532" alt="SessionFlow-discuss2" src="https://github.com/user-attachments/assets/a1bb358a-0e07-486e-8d9b-350aa57ec29a" />
+<img width="1440" alt="SessionFlow 多模型规划图，Claude、Codex 和 Grok 规划者连接到综合者" src="./docs/images/sessionflow-plan-council.jpg" />
 
 内置的 **Plan Council** 会保留提案、分歧、互评和走到最终决定的完整路径——
 而不只是最终答案。更复杂的辩论工作流可以持续交换 feedback，直到满足共识规则

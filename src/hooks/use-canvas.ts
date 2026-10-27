@@ -22,6 +22,23 @@ import { isProviderKind } from '@/components/brand-icons';
 import { draftCanvasEdges, draftCanvasNodes } from '@/lib/draft-graph-view';
 import type { DraftGraphState } from '@/hooks/use-draft-graph';
 import { routeRuntimeAgentEdges } from '@shared/canvas-edge-routing';
+import {
+  defaultAgentNodeWidth,
+  defaultAgentNodeHeight,
+  readCanvasNodeSizes,
+  reconcileCanvasNodePresentation,
+  updateCanvasNodeSize,
+  writeCanvasNodeSizes,
+  type CanvasNodeSize,
+  type CanvasNodeSizes,
+} from '@/lib/canvas-node-sizes';
+import {
+  filterVisibleCanvasEdges,
+  readHiddenCanvasAgents,
+  setCanvasAgentHidden,
+  visibleCanvasGraphState,
+  writeHiddenCanvasAgents,
+} from '@/lib/canvas-agent-visibility';
 
 function sameStringList(left: string[], right: string[]) {
   return left.length === right.length && left.every((value, index) => value === right[index]);
@@ -62,26 +79,67 @@ export function useCanvas({
   draft: DraftGraphState;
 }) {
   const { graph: draftGraph, validation: draftValidation, dispatch: draftDispatch } = draft;
+  const [nodeSizes, setNodeSizes] = useState<CanvasNodeSizes>(readCanvasNodeSizes);
+  const [hiddenAgentIds, setHiddenAgentIds] = useState(readHiddenCanvasAgents);
+  const agentNodesRef = useRef(new Map<string, GraphState['nodes'][number]>());
+  agentNodesRef.current = new Map(runtimeState.nodes.map((node) => [node.nodeId, node]));
+  const removeAgentFromGraph = useCallback((nodeId: string) => {
+    if (agentNodesRef.current.has(nodeId)) setHiddenAgentIds((current) => setCanvasAgentHidden(current, nodeId, true));
+  }, []);
+  const restoreAgentToGraph = useCallback((nodeId: string) => {
+    if (agentNodesRef.current.has(nodeId)) setHiddenAgentIds((current) => setCanvasAgentHidden(current, nodeId, false));
+  }, []);
+  const visibleGraphState = useMemo(() => visibleCanvasGraphState(runtimeState, hiddenAgentIds), [runtimeState, hiddenAgentIds]);
+  const resizeAgentNode = useCallback(
+    (nodeId: string, size: CanvasNodeSize, position?: { x: number; y: number }) => {
+      const node = agentNodesRef.current.get(nodeId);
+      if (!node) return;
+      setNodeSizes((current) => updateCanvasNodeSize(current, nodeId, size));
+      if (!position || !Number.isFinite(position.x) || !Number.isFinite(position.y) || (node.position.x === position.x && node.position.y === position.y))
+        return;
+
+      // North/west resizing moves the origin as well as changing the size.
+      // Reuse the existing layout-position path so later snapshots keep it.
+      const updates = [{ nodeId, position: { x: position.x, y: position.y } }];
+      setRuntimeState((current) => applyNodePositionUpdates(current, updates, new Date().toISOString()) as GraphState);
+      runtimeApi?.updateNodePositions({ positions: updates }).catch((error: unknown) => {
+        setRuntimeError(error instanceof Error ? error.message : String(error));
+      });
+    },
+    [runtimeApi, setRuntimeError, setRuntimeState],
+  );
+
+  useEffect(() => {
+    writeCanvasNodeSizes(nodeSizes);
+  }, [nodeSizes]);
+  useEffect(() => {
+    writeHiddenCanvasAgents(hiddenAgentIds);
+  }, [hiddenAgentIds]);
+
   const nodes: Node[] = useMemo(
     () => [
-      ...clusterBoundaryNodes(runtimeState),
+      ...clusterBoundaryNodes(visibleGraphState, nodeSizes),
       // L4/L2 synthetic presences: clock sources, external sources, and
       // ring badges. Their positions derive from session nodes, so they
       // re-place on every state change and never persist.
-      ...timerNodes(runtimeState),
-      ...sourceNodes(runtimeState),
-      ...loopBadgeNodes(runtimeState),
+      ...timerNodes(visibleGraphState),
+      ...sourceNodes(visibleGraphState),
+      ...loopBadgeNodes(visibleGraphState, nodeSizes),
       ...draftCanvasNodes(draftGraph, draftValidation.issues),
-      ...runtimeState.nodes.map((node) => {
+      ...visibleGraphState.nodes.map((node) => {
         const session = runtimeState.sessions[node.sessionId];
         const cluster = node.clusterId ? runtimeState.clusters[node.clusterId] : undefined;
         const latestReport = latestReportForSession(runtimeState.reports, node.sessionId);
         const latestVerdict = latestReport?.payload.type === 'verdict' ? latestReport.payload.verdict : undefined;
         const latestIssueCount = latestReport ? reportIssueCount(latestReport) : undefined;
+        const size = nodeSizes[node.nodeId] ?? { width: defaultAgentNodeWidth, height: defaultAgentNodeHeight };
         return {
           id: node.nodeId,
           type: 'agent',
           position: node.position,
+          width: size.width,
+          height: size.height,
+          style: { width: size.width, height: size.height },
           zIndex: node.role === 'master' ? 20 : 10,
           data: {
             label: session ? sessionDisplayLabel(session) : node.label,
@@ -101,11 +159,13 @@ export function useCanvas({
             masterReason: node.masterReason,
             clusterLabel: cluster?.label,
             isManaged: Boolean(cluster?.nodeIds.includes(node.nodeId)),
+            onResize: resizeAgentNode,
+            onRemoveFromGraph: removeAgentFromGraph,
           },
         };
       }),
     ],
-    [draftGraph, draftValidation.issues, runtimeState],
+    [draftGraph, draftValidation.issues, nodeSizes, removeAgentFromGraph, resizeAgentNode, runtimeState, visibleGraphState],
   );
   const [canvasNodes, setCanvasNodes] = useState<Node[]>(nodes);
   const canvasNodesSignatureRef = useRef(canvasNodesRenderSignature(nodes));
@@ -172,7 +232,7 @@ export function useCanvas({
       };
     });
 
-    return routeRuntimeAgentEdges([...historyEdges, ...intentEdges, ...draftCanvasEdges(draftGraph)], nodes);
+    return filterVisibleCanvasEdges(routeRuntimeAgentEdges([...historyEdges, ...intentEdges, ...draftCanvasEdges(draftGraph)], nodes), nodes);
   }, [draftGraph, nodes, reportsById, runtimeState]);
 
   useEffect(() => {
@@ -184,11 +244,21 @@ export function useCanvas({
       return;
     }
     canvasNodesSignatureRef.current = signature;
-    setCanvasNodes(nodes);
+    setCanvasNodes((current) => reconcileCanvasNodePresentation(nodes, current));
   }, [nodes]);
 
   const updateCanvasNodePositions = useCallback((changes: NodeChange[]) => {
     setCanvasNodes((current) => applyNodeChanges(changes, current));
+    // ResizeObserver also emits dimension changes. Only an explicit completed
+    // user resize should become a saved presentation preference.
+    const resized = changes.flatMap((change) =>
+      change.type === 'dimensions' && change.resizing === false && change.dimensions && agentNodesRef.current.has(change.id)
+        ? [{ id: change.id, size: change.dimensions }]
+        : [],
+    );
+    if (resized.length > 0) {
+      setNodeSizes((current) => resized.reduce((next, { id, size }) => updateCanvasNodeSize(next, id, size), current));
+    }
   }, []);
 
   const beginCanvasNodeDrag = useCallback(() => {
@@ -208,23 +278,15 @@ export function useCanvas({
       }
 
       setCanvasNodes((current) => applyFlowNodePositionUpdates(current, updates));
-      setRuntimeState((current) =>
-        applyNodePositionUpdates(
-          current,
-          updates,
-          new Date().toISOString(),
-        ) as GraphState
-      );
+      setRuntimeState((current) => applyNodePositionUpdates(current, updates, new Date().toISOString()) as GraphState);
 
       if (!runtimeApi) {
         return;
       }
 
-      runtimeApi
-        .updateNodePositions({ positions: updates })
-        .catch((error: unknown) => {
-          setRuntimeError(error instanceof Error ? error.message : String(error));
-        });
+      runtimeApi.updateNodePositions({ positions: updates }).catch((error: unknown) => {
+        setRuntimeError(error instanceof Error ? error.message : String(error));
+      });
     },
     [draftDispatch, draftGraph.nodes, runtimeApi, setRuntimeError, setRuntimeState],
   );
@@ -262,6 +324,8 @@ export function useCanvas({
     beginCanvasNodeDrag,
     persistCanvasNodePositions,
     updateCanvasSelection,
+    hiddenAgentIds,
+    restoreAgentToGraph,
   };
 }
 

@@ -12,11 +12,14 @@ import {
   codexGoalRunUnavailableCode,
 } from './providers/codexAppServerAdapter.js'
 import { GrokAcpAdapter } from './providers/grokAcpAdapter.js'
+import { SshProviderAdapter } from './providers/sshProviderAdapter.js'
+import { normalizeWorkspaceConnection, workspaceConnectionKey } from './workspace/remoteWorkspace.js'
 
 type JsonRecord = Record<string, any>
 
 type ProviderAdapter = {
   startTurn: (input: JsonRecord) => any
+  closeSession?: (sessionId: string) => unknown
   closeAll?: () => unknown
 }
 
@@ -37,6 +40,7 @@ function safeLogPart(value: string) {
 
 export class ProviderService extends EventEmitter {
   #adapters: Map<string, ProviderAdapter>
+  #sshAdapter: ProviderAdapter
   #instances = new Map<string, JsonRecord>()
   #bindings = new Map<string, JsonRecord>()
   #activeTurns = new Map<string, JsonRecord>()
@@ -56,10 +60,12 @@ export class ProviderService extends EventEmitter {
     adapters,
     providerInstances,
     logRoot,
+    sshAdapter,
   }: {
     adapters?: Map<string, ProviderAdapter>
     providerInstances?: JsonRecord[]
     logRoot?: string
+    sshAdapter?: ProviderAdapter
   } = {}) {
     super()
     const defaultAdapters = new Map<string, ProviderAdapter>([
@@ -71,6 +77,7 @@ export class ProviderService extends EventEmitter {
       ...defaultAdapters,
       ...(adapters ?? new Map<string, ProviderAdapter>()),
     ])
+    this.#sshAdapter = sshAdapter ?? new SshProviderAdapter()
     this.#logRoot =
       typeof logRoot === 'string' && logRoot.length > 0 ? logRoot : defaultLogRoot()
 
@@ -122,7 +129,8 @@ export class ProviderService extends EventEmitter {
       existing.providerInstanceId === input.providerInstanceId &&
       existing.providerSessionId === input.providerSessionId &&
       existing.resumeCursor === input.resumeCursor &&
-      existing.cwd === input.cwd
+      existing.cwd === input.cwd &&
+      existing.connectionKey === (input.connectionKey ?? 'local')
     ) {
       return existing
     }
@@ -134,6 +142,7 @@ export class ProviderService extends EventEmitter {
       providerSessionId: input.providerSessionId,
       resumeCursor: input.resumeCursor,
       cwd: input.cwd,
+      connectionKey: input.connectionKey ?? 'local',
       createdAt: existing?.createdAt ?? ts,
       updatedAt: ts,
     }
@@ -161,9 +170,19 @@ export class ProviderService extends EventEmitter {
       )
     }
 
-    const adapter = this.#adapters.get(providerKind)
+    const connection = normalizeWorkspaceConnection(input.workspaceConnection)
+    const adapter = connection?.kind === 'ssh' ? this.#sshAdapter : this.#adapters.get(providerKind)
     if (!adapter) {
       throw new Error(`Provider runtime unavailable: ${providerKind}`)
+    }
+
+    const nextConnectionKey = workspaceConnectionKey(connection)
+    const previousBinding = this.#bindings.get(input.sessionId)
+    if (previousBinding && (previousBinding.connectionKey ?? 'local') === 'local' && nextConnectionKey !== 'local') {
+      const previousKind = this.#instances.get(previousBinding.providerInstanceId)?.kind
+      // A cached local Claude query belongs to the old native conversation.
+      // Leaving its host must not let a later return silently reuse it.
+      if (previousKind) this.#adapters.get(previousKind)?.closeSession?.(input.sessionId)
     }
 
     this.bindSession({
@@ -172,6 +191,7 @@ export class ProviderService extends EventEmitter {
       providerSessionId: input.backendSessionId,
       resumeCursor: input.providerResumeCursor,
       cwd: input.cwd,
+      connectionKey: nextConnectionKey,
     })
 
     const run = adapter.startTurn({
@@ -202,6 +222,7 @@ export class ProviderService extends EventEmitter {
         providerSessionId: event.providerSessionId,
         resumeCursor: event.resumeCursor,
         cwd: input.cwd,
+        connectionKey: workspaceConnectionKey(connection),
       })
     })
     run.on?.('native', (event) => {
@@ -269,7 +290,7 @@ export class ProviderService extends EventEmitter {
       }
     }
     const adapterClosures: Promise<unknown>[] = []
-    for (const adapter of this.#adapters.values()) {
+    for (const adapter of new Set([...this.#adapters.values(), this.#sshAdapter])) {
       if (typeof adapter.closeAll === 'function') {
         adapterClosures.push(Promise.resolve(adapter.closeAll()))
       }

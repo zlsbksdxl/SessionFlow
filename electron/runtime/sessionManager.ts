@@ -350,6 +350,7 @@ export class RuntimeSessionManager {
     checkpointHost: () => this.#checkpointHost(),
     humanCtx: () => this.#humanCtx(),
     reviveDirectProviderRuntime: () => this.#reviveDirectProviderRuntime(),
+    providerRuntimeLifecycleEpoch: () => this.#sessionRuntime.lifecycleEpoch(),
     workflowDeploymentCrashAfterResourceCreate: () =>
       this.#workflowDeploymentCrashAfterResourceCreate,
     getState: () => this.getState(),
@@ -452,6 +453,18 @@ export class RuntimeSessionManager {
     activate: (input, ctx) => this.#sessionCommands.cmdActivate(input, ctx),
     archive_session: (input, ctx) =>
       this.#sessionCommands.cmdArchiveSession(input, ctx),
+    upsert_chat_project: (input, ctx) =>
+      this.#sessionCommands.cmdUpsertChatProject(input, ctx),
+    move_chat_to_project: (input, ctx) =>
+      this.#sessionCommands.cmdMoveChatToProject(input, ctx),
+    rename_chat: (input, ctx) =>
+      this.#sessionCommands.cmdRenameChat(input, ctx),
+    update_chat_project: (input, ctx) => this.#sessionCommands.cmdUpdateChatProject(input, ctx),
+    test_chat_project_connection: (input, ctx) => this.#sessionCommands.cmdTestChatProjectConnection(input, ctx),
+    archive_chat_project_chats: (input, ctx) => this.#sessionCommands.cmdArchiveChatProjectChats(input, ctx),
+    remove_chat_project: (input, ctx) => this.#sessionCommands.cmdRemoveChatProject(input, ctx),
+    upsert_chat_project_section: (input, ctx) => this.#sessionCommands.cmdUpsertChatProjectSection(input, ctx),
+    remove_chat_project_section: (input, ctx) => this.#sessionCommands.cmdRemoveChatProjectSection(input, ctx),
     kill_session: (input, ctx) =>
       this.#sessionCommands.cmdKillSession(input, ctx),
     respond_runtime_request: (input, ctx) =>
@@ -556,6 +569,7 @@ export class RuntimeSessionManager {
     emit,
     snapshotPersistDelayMs,
     providerAdapters,
+    sshProviderAdapter,
     nativeSessionCatalog,
     workflowDeploymentCrashAfterStage,
     workflowDeploymentCrashAfterResourceCreate = false,
@@ -713,6 +727,7 @@ export class RuntimeSessionManager {
     this.#providerService = new ProviderService({
       providerInstances: this.#state.providerInstances,
       adapters: providerAdapters instanceof Map ? providerAdapters : undefined,
+      sshAdapter: sshProviderAdapter,
     })
     recoverWorkflowDeployments(this.#wf())
     reconcileDynamicTopology(this.#wf())
@@ -992,11 +1007,13 @@ export class RuntimeSessionManager {
     const state = this.#readState()
     const existing = Object.values(state.sessions as JsonRecord).find((session) => {
       if (session.providerKind !== summary.providerKind) return false
+      if (session.workspaceConnection?.kind === 'ssh' ||
+          (session.providerConnectionKey ?? 'local') !== 'local' ||
+          (session.providerSessionId ?? session.backendSessionId) !== summary.nativeSessionId) return false
       if (session.nativeSessionOrigin) {
         return session.nativeSessionOrigin.sourceKey === summary.sourceKey &&
           session.nativeSessionOrigin.nativeSessionId === summary.nativeSessionId
       }
-      if (session.providerSessionId !== summary.nativeSessionId && session.backendSessionId !== summary.nativeSessionId) return false
       const profile = state.providerInstances.find((instance) =>
         instance.providerInstanceId === session.providerInstanceId && instance.kind === summary.providerKind,
       )

@@ -43,6 +43,7 @@ export function completedTurnCount(host: CheckpointHost, session) {
 
 export function captureTurnCheckpoint(host: CheckpointHost, { sessionId, turnId, turnCount, stage }) {
   const session = host.state.sessions[sessionId]
+  if (session?.workspaceConnection?.kind === 'ssh') throw new Error('Local Git checkpoints are unavailable for SSH workspaces.')
   if (!session) {
     throw new Error(`Unknown session: ${sessionId}`)
   }
@@ -156,6 +157,7 @@ export function diffSummaryForCheckpointRange(host: CheckpointHost, {
 
 export function recordTurnCheckpointDiff(host: CheckpointHost, sessionId, ts) {
   const session = host.state.sessions[sessionId]
+  if (session?.workspaceConnection?.kind === 'ssh') return
   const context = host.runContext.get(sessionId)
   if (!session || !context || context.turnDiffRecorded === true) {
     return
@@ -241,6 +243,7 @@ export function recordTurnCheckpointDiff(host: CheckpointHost, sessionId, ts) {
 
 export function pruneTurnCheckpointRefs(host: CheckpointHost, sessionId) {
   const session = host.state.sessions[sessionId]
+  if (session?.workspaceConnection?.kind === 'ssh') return
   if (!session) {
     return
   }
@@ -319,6 +322,7 @@ export function gitDiffForSession(host: CheckpointHost, sessionId) {
 
 export function checkpointDiffForSession(host: CheckpointHost, sessionId, options: JsonRecord = {}) {
   const session = host.state.sessions[sessionId]
+  if (session?.workspaceConnection?.kind === 'ssh') throw new Error('Local checkpoint diffs are unavailable for SSH workspaces.')
   if (!session) {
     throw new Error(`Unknown session: ${sessionId}`)
   }
@@ -379,6 +383,7 @@ export function checkpointDiffForSession(host: CheckpointHost, sessionId, option
 
 export function workingTreeDiffForSession(host: CheckpointHost, sessionId, options: JsonRecord = {}) {
   const session = host.state.sessions[sessionId]
+  if (session?.workspaceConnection?.kind === 'ssh') throw new Error('Local working-tree diffs are unavailable for SSH workspaces.')
   if (!session) {
     throw new Error(`Unknown session: ${sessionId}`)
   }

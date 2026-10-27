@@ -17,6 +17,7 @@ import { TemplateLibraryPanel } from '@/components/template-library';
 import { useRuntimeCore } from '@/hooks/use-runtime-core';
 import { useLayoutPrefs } from '@/hooks/use-layout-prefs';
 import { useComposer } from '@/hooks/use-composer';
+import { useSessionComposerSettings } from '@/hooks/use-session-composer-settings';
 import { useNewChatSetup } from '@/hooks/use-new-chat-setup';
 import { useSessionList } from '@/hooks/use-session-list';
 import { useTerminalPanel } from '@/hooks/use-terminal-panel';
@@ -32,6 +33,7 @@ import { AgentSettingsPanel } from '@/components/agent-settings-panel';
 import { AppearanceSettingsPanel } from '@/components/appearance-settings-panel';
 import { NativeSessionImportDialog } from '@/components/native-session-import-dialog';
 import { preferRuntimeSnapshot } from '../shared/runtime-state-patch';
+import { defaultWorkspaceCwd, latestSessionCwd } from '@/lib/workspace';
 
 function App() {
   const [activeTab, setActiveTab] = useState<RailTab>('chat');
@@ -89,6 +91,7 @@ function App() {
   };
 
   const composer = useComposer({ setRuntimeError });
+  const sessionComposerSettings = useSessionComposerSettings(selectedSession);
   const { message, composerAttachments, composerEditorRef, setComposerText, clearComposer } = composer;
 
   const newChat = useNewChatSetup({
@@ -106,6 +109,8 @@ function App() {
     newProviderKind,
     newCwd,
     setNewCwd,
+    newWorkspaceConnection,
+    setNewWorkspaceConnection,
     newWorkMode,
     setNewWorkMode,
     newBranch,
@@ -117,6 +122,25 @@ function App() {
     changeNewProviderKind,
     restoreCwdFallback,
   } = newChat;
+  const remoteWorkspaceSelected = selectedSession ? selectedSession.workspaceConnection?.kind === 'ssh' : newWorkspaceConnection.kind === 'ssh';
+  const localWorkflowCwd = newWorkspaceConnection.kind === 'ssh'
+    ? latestSessionCwd(sessions.filter((session) => session.workspaceConnection?.kind !== 'ssh'), invalidProjectCwds) ?? defaultWorkspaceCwd()
+    : newCwd;
+  const requireLocalWorkflow = () => {
+    if (!remoteWorkspaceSelected) return true;
+    setRuntimeError('Workflows and group chats currently require a project on this computer. Choose a local project first.');
+    return false;
+  };
+  const setSupportedActiveTab: typeof setActiveTab = (next) => {
+    const tab = typeof next === 'function' ? next(activeTab) : next;
+    if (tab === 'orchestrate' && !requireLocalWorkflow()) return;
+    setActiveTab(tab);
+  };
+  const setSupportedWorkflowLibraryOpen: typeof setIsWorkflowLibraryOpen = (next) => {
+    const open = typeof next === 'function' ? next(isWorkflowLibraryOpen) : next;
+    if (open && !requireLocalWorkflow()) return;
+    setIsWorkflowLibraryOpen(open);
+  };
 
   const sessionList = useSessionList({
     runtimeApi,
@@ -169,10 +193,14 @@ function App() {
       clearComposer,
       setComposerText,
       composerEditorRef,
+      sessionRuntimeSettingsPatch: sessionComposerSettings.runtimeSettingsPatch,
+      clearSessionSettings: sessionComposerSettings.clear,
     },
     newChat: {
       newCwd,
       setNewCwd,
+      newWorkspaceConnection,
+      setNewWorkspaceConnection,
       newWorkMode,
       setNewWorkMode,
       newBranch,
@@ -205,7 +233,7 @@ function App() {
   const draft = useDraftGraph({
     runtimeApi,
     runtimeState,
-    defaultCwd: newCwd,
+    defaultCwd: localWorkflowCwd,
     setRuntimeState,
     setRuntimeError,
   });
@@ -236,7 +264,7 @@ function App() {
     setActiveClusterId,
     setPendingLinkedSourceId,
     newChat: {
-      newCwd,
+      newCwd: localWorkflowCwd,
       newProviderKind,
       newRuntimeMode,
       newModel,
@@ -246,6 +274,17 @@ function App() {
   });
   const isSettingsPage = activeTab === 'agents' || activeTab === 'appearance';
   const showGraphSurface = !isSettingsPage && activeTab !== 'workspace';
+  const runtimeNotices = (
+    <>
+      {runtimeError ? (
+        <div className="app-region-no-drag mx-3 mb-2 flex shrink-0 items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 font-mono text-[11.5px] leading-5 text-destructive">
+          <span className="shrink-0">✗</span>
+          <span className="min-w-0 break-words">{runtimeError}</span>
+        </div>
+      ) : null}
+      <RuntimeDiagnosticsToast diagnostics={runtimeDiagnostics} sessions={sessions} />
+    </>
+  );
 
   return (
     <TooltipProvider>
@@ -258,10 +297,11 @@ function App() {
           actions={actions}
           interactions={interactions}
           activeTab={activeTab}
-          setActiveTab={setActiveTab}
+          setActiveTab={setSupportedActiveTab}
           selectedWorkspaceId={selectedWorkspaceId}
           onImportChat={() => setIsNativeSessionImportOpen(true)}
           onNewWorkspace={() => {
+            if (!requireLocalWorkflow()) return;
             setOpenPlanCouncilId(undefined);
             setSelectedWorkspaceId(undefined);
             setReturnToWorkspaceId(undefined);
@@ -274,6 +314,7 @@ function App() {
             setActiveTab('workspace');
           }}
           onStartWorkflow={() => {
+            if (!requireLocalWorkflow()) return;
             setGraphCollapsed(false);
             setIsWorkflowLibraryOpen(true);
           }}
@@ -306,39 +347,15 @@ function App() {
           className={cn('relative flex min-h-0 flex-col overflow-hidden bg-background', effectiveGraphCollapsed || !showGraphSurface ? 'flex-1' : 'shrink-0')}
           style={effectiveGraphCollapsed || !showGraphSurface ? undefined : { width: chatPanelWidth, minWidth: chatPanelMinWidth }}
         >
-          {runtimeError ? (
-            <div className="app-region-no-drag mx-3 mb-2 flex shrink-0 items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 font-mono text-[11.5px] leading-5 text-destructive">
-              <span className="shrink-0">✗</span>
-              <span className="min-w-0 break-words">{runtimeError}</span>
-            </div>
-          ) : null}
-          <RuntimeDiagnosticsToast diagnostics={runtimeDiagnostics} sessions={sessions} />
+          {activeTab !== 'chat' ? runtimeNotices : null}
           <div className="app-region-no-drag flex min-h-0 flex-1 flex-col overflow-hidden">
-            {activeTab === 'chat' &&
-            returnToWorkspaceId &&
-            runtimeState.collaborationSessions?.[returnToWorkspaceId]?.members.some((member) => member.sessionId === selectedSessionId) ? (
-              <div className="border-b border-border px-4 py-2">
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => {
-                    setSelectedWorkspaceId(returnToWorkspaceId);
-                    setActiveTab('workspace');
-                    setReturnToWorkspaceId(undefined);
-                  }}
-                >
-                  ← Back to group chat
-                </Button>
-                <span className="ml-2 text-xs text-muted-foreground">Private member chat</span>
-              </div>
-            ) : null}
             {activeTab === 'workspace' || selectedWorkspaceId ? (
               <div className={cn('min-h-0 flex-1 flex-col', activeTab === 'workspace' ? 'flex' : 'hidden')}>
                 <CollaborationWorkspacePanel
                   key={selectedWorkspaceId ?? 'new-workspace'}
                   runtimeApi={runtimeApi}
                   runtimeState={runtimeState}
-                  defaultCwd={newCwd}
+                  defaultCwd={localWorkflowCwd}
                   workspaceId={selectedWorkspaceId}
                   initialMessage={workspaceDraft && workspaceDraft.workspaceId === selectedWorkspaceId ? workspaceDraft.text : undefined}
                   onInitialMessageConsumed={() => setWorkspaceDraft((current) => (current?.workspaceId === selectedWorkspaceId ? undefined : current))}
@@ -367,9 +384,32 @@ function App() {
             ) : null}
             {activeTab === 'chat' ? (
               <ChatDetail
+                headerNotices={
+                  <>
+                    {runtimeNotices}
+                    {returnToWorkspaceId &&
+                    runtimeState.collaborationSessions?.[returnToWorkspaceId]?.members.some((member) => member.sessionId === selectedSessionId) ? (
+                      <div className="border-b border-border px-4 py-2">
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => {
+                            setSelectedWorkspaceId(returnToWorkspaceId);
+                            setActiveTab('workspace');
+                            setReturnToWorkspaceId(undefined);
+                          }}
+                        >
+                          ← Back to group chat
+                        </Button>
+                        <span className="ml-2 text-xs text-muted-foreground">Private member chat</span>
+                      </div>
+                    ) : null}
+                  </>
+                }
                 core={core}
                 layout={layout}
                 composer={composer}
+                sessionComposerSettings={sessionComposerSettings}
                 newChat={newChat}
                 terminal={terminal}
                 actions={actions}
@@ -386,6 +426,14 @@ function App() {
                   setGraphCollapsed(false);
                 }}
                 onOpenAgentSettings={() => setActiveTab('agents')}
+                onShowOnGraph={
+                  selectedSession && canvas.hiddenAgentIds.includes(selectedSession.sessionId)
+                    ? () => {
+                        canvas.restoreAgentToGraph(selectedSession.sessionId);
+                        setGraphCollapsed(false);
+                      }
+                    : undefined
+                }
               />
             ) : null}
             {activeTab === 'agents' ? (
@@ -395,7 +443,7 @@ function App() {
                 runtimeStatusText={core.runtimeStatusText}
                 providerInstances={providerInstances}
                 providerSetupSnapshots={runtimeState.providerSetupSnapshots}
-                cwd={newCwd}
+                cwd={localWorkflowCwd}
                 savingProviderInstanceId={newChat.savingProviderInstanceId}
                 providerInstanceError={newChat.providerInstanceError}
                 onSaveProviderInstance={newChat.saveProviderInstance}
@@ -436,7 +484,7 @@ function App() {
               }
             }}
           >
-            <span className="h-10 w-px rounded-full bg-border transition group-hover/split:bg-accent-ink group-focus-visible/split:bg-accent-ink" />
+            <span className="h-full w-px bg-border/60 transition group-hover/split:bg-accent-ink group-focus-visible/split:bg-accent-ink" />
           </div>
         )}
 
@@ -450,8 +498,8 @@ function App() {
             canvas={canvas}
             draft={draft}
             isWorkflowLibraryOpen={isWorkflowLibraryOpen}
-            setIsWorkflowLibraryOpen={setIsWorkflowLibraryOpen}
-            setActiveTab={setActiveTab}
+            setIsWorkflowLibraryOpen={setSupportedWorkflowLibraryOpen}
+            setActiveTab={setSupportedActiveTab}
             setActiveClusterId={setActiveClusterId}
             openLoopId={openLoopId}
             setOpenLoopId={setOpenLoopId}
@@ -464,7 +512,7 @@ function App() {
             }}
           />
         )}
-        {!isSettingsPage && selectedSession && isWorkspacePanelOpen ? (
+        {!isSettingsPage && selectedSession && selectedSession.workspaceConnection?.kind !== 'ssh' && isWorkspacePanelOpen ? (
           <div className="app-region-no-drag absolute inset-y-0 right-0 z-40 flex max-w-full shadow-2xl">
             <SessionWorkspacePanel
               sessionId={selectedSession.sessionId}
@@ -475,7 +523,7 @@ function App() {
           </div>
         ) : null}
         {openPlanCouncil ? (
-          <div className="app-region-no-drag absolute bottom-0 right-0 top-14 z-40 w-[min(72vw,1080px)] min-w-[560px] max-w-full">
+          <div className="app-region-no-drag absolute bottom-0 right-0 top-11 z-40 w-[min(72vw,1080px)] min-w-[560px] max-w-full">
             <PlanCouncilWorkbench
               council={openPlanCouncil}
               runtimeState={runtimeState}
@@ -510,9 +558,9 @@ function App() {
             />
           </div>
         ) : null}
-        {isWorkflowLibraryOpen ? (
+        {isWorkflowLibraryOpen && !remoteWorkspaceSelected ? (
           <div
-            className="app-region-no-drag absolute bottom-0 right-0 top-14 z-50 flex max-w-full shadow-2xl"
+            className="app-region-no-drag absolute bottom-0 right-0 top-11 z-50 flex max-w-full shadow-2xl"
             role="dialog"
             aria-modal="true"
             aria-label="New Workflow"
@@ -530,7 +578,7 @@ function App() {
               onStateChange={acceptRuntimeState}
               onError={setRuntimeError}
               autoFocusClose
-              defaultCwd={newCwd}
+              defaultCwd={localWorkflowCwd}
               onWorkflowStarted={({ coderSessionId, loopId, notice }) => {
                 setSelectedSessionId(coderSessionId);
                 setActiveTab('chat');

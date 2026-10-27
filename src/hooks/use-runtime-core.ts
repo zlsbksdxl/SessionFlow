@@ -46,7 +46,7 @@ export function useRuntimeCore() {
     runtimeClient.kind === 'http'
       ? `Web runtime ${runtimeClient.runtimeUrl}`
       : runtimeClient.kind === 'electron'
-        ? 'Electron runtime'
+        ? 'Desktop connected'
         : runtimeClient.kind === 'connecting'
           ? `Connecting to web runtime ${runtimeClient.runtimeUrl}`
           : runtimeClient.kind === 'unavailable' && runtimeClient.runtimeUrl

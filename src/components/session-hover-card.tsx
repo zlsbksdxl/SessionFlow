@@ -1,22 +1,15 @@
-import type { ReactElement } from 'react';
-import { Clock3, FolderOpen, Hash } from 'lucide-react';
+import { useEffect, useRef, useState, type ReactElement } from 'react';
+import { Clock3, FolderOpen } from 'lucide-react';
 import { HoverCard } from 'radix-ui';
 import type { AgentSession } from '@/shared/graph-state';
 import { formatTimestamp } from '@/lib/format';
 import { runtimeConfigSummary } from '@/lib/provider-catalog';
-import { sessionChatId, sessionDisplayLabel, sessionProviderLabel, statusDotClassNames, statusLabels } from '@/lib/session-display';
-import { cn } from '@/lib/utils';
+import { sessionDisplayLabel, sessionProviderLabel } from '@/lib/session-display';
 
 function SessionDetails({ session }: { session: AgentSession }) {
   return (
     <>
-      <div className="flex items-start gap-3">
-        <p className="min-w-0 flex-1 break-words text-sm font-medium leading-5">{sessionDisplayLabel(session)}</p>
-        <span className="mt-0.5 flex shrink-0 items-center gap-1.5 text-[11px] text-muted-foreground">
-          <span className={cn('size-1.5 rounded-full', statusDotClassNames[session.status])} />
-          {statusLabels[session.status]}
-        </span>
-      </div>
+      <p className="break-words text-sm font-medium leading-5">{sessionDisplayLabel(session)}</p>
       <p className="mt-1.5 break-words text-xs leading-5 text-muted-foreground">
         {sessionProviderLabel(session)} · {runtimeConfigSummary(session.providerKind, session.runtimeSettings, session.effectiveRuntimeConfig)}
       </p>
@@ -25,12 +18,6 @@ function SessionDetails({ session }: { session: AgentSession }) {
           <FolderOpen className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
           <span className="min-w-0 break-all" aria-label="Project directory">
             {session.cwd.trim() || 'No project'}
-          </span>
-        </div>
-        <div className="flex items-start gap-2.5 text-muted-foreground">
-          <Hash className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
-          <span className="min-w-0 break-all font-mono text-[11px]" aria-label="Chat ID">
-            {sessionChatId(session)}
           </span>
         </div>
         <div className="flex items-center gap-2.5 text-muted-foreground">
@@ -42,10 +29,44 @@ function SessionDetails({ session }: { session: AgentSession }) {
   );
 }
 
-export function SessionHoverCard({ session, children }: { session: AgentSession; children: ReactElement }) {
+export function SessionHoverCard({ session, children, disabled = false }: { session: AgentSession; children: ReactElement; disabled?: boolean }) {
+  const [open, setOpen] = useState(false);
+  const allowOpenRef = useRef(true);
+
+  useEffect(() => {
+    if (disabled) {
+      allowOpenRef.current = false;
+      setOpen(false);
+    }
+  }, [disabled]);
+
   return (
-    <HoverCard.Root openDelay={500} closeDelay={150}>
-      <HoverCard.Trigger asChild>{children}</HoverCard.Trigger>
+    <HoverCard.Root
+      open={open && !disabled}
+      onOpenChange={(nextOpen) => {
+        if (!nextOpen || (!disabled && allowOpenRef.current)) setOpen(nextOpen);
+      }}
+      openDelay={500}
+      closeDelay={150}
+    >
+      <HoverCard.Trigger
+        asChild
+        onPointerEnter={(event) => {
+          if (disabled) event.preventDefault();
+          else allowOpenRef.current = true;
+        }}
+        onFocus={(event) => {
+          if (disabled) event.preventDefault();
+          else allowOpenRef.current = true;
+        }}
+        onContextMenu={() => {
+          // A queued hover delay must not reopen the card after the menu closes.
+          allowOpenRef.current = false;
+          setOpen(false);
+        }}
+      >
+        {children}
+      </HoverCard.Trigger>
       <HoverCard.Portal>
         <HoverCard.Content
           side="right"

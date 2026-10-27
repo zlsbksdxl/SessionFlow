@@ -68,6 +68,9 @@ export const graphStateSchema = {
     nodes: 'GraphNode[]',
     edges: 'GraphEdge[]',
     sessions: 'Record<SessionId, AgentSession>',
+    chatProjects: 'Record<projectId, ChatProject>?; explicitly registered sidebar project directories',
+    chatProjectSections: 'Record<sectionId, ChatProjectSection>?; optional sidebar project sections',
+    chatProjectMembershipVersion: '1?; completed one-time migration of legacy workspace memberships',
     providerInstances: 'ProviderInstance[]; local provider runtime profiles',
     providerSetupSnapshots:
       'Record<providerInstanceId, ProviderSetupSnapshot>; durable sanitized readiness cache with profile/cwd invalidation',
@@ -287,6 +290,14 @@ export const graphStateSchema = {
         runtimeSettings:
           'ProviderRuntimeSettings?; runtime mode, model, reasoning effort, sandbox/approval policy hints',
       },
+    },
+    resumeSession: {
+      input: {
+        base: 'ResumeRuntimeSessionInput; continue the original provider conversation',
+        runtimeSettings:
+          'Partial<Pick<ProviderRuntimeSettings, "runtimeMode" | "model" | "reasoningEffort">>?; human-only next-turn edits for idle/failed chats; omitted fields are preserved, empty model restores a verified provider default',
+      },
+      output: '{ ok, runId, state }; no new or forked provider conversation',
     },
     forkSession: {
       input: {
@@ -610,6 +621,9 @@ export function createEmptyGraphState() {
     nodes: [],
     edges: [],
     sessions: {},
+    chatProjects: {},
+    chatProjectSections: {},
+    chatProjectMembershipVersion: 1,
     providerInstances: defaultGraphProviderInstances.map((instance) => ({
       ...instance,
     })),

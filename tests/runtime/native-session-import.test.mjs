@@ -8,6 +8,7 @@ import { RuntimeSessionManager } from '../../dist-electron/electron/runtime/sess
 import { normalizeSession } from '../../dist-electron/electron/runtime/persistence/runtimeStateRecovery.js'
 import { resolveProviderLaunch } from '../../dist-electron/electron/runtime/providers/providerLaunch.js'
 import { nativeSessionSourceKey } from '../../dist-electron/electron/runtime/sessions/nativeSessionSource.js'
+import { bindSessionWorkspaceConnection } from '../../dist-electron/electron/runtime/sessions/workspaceConnectionState.js'
 import { DeterministicProviderAdapter } from './support/deterministic-provider.mjs'
 
 function fixture() {
@@ -167,6 +168,51 @@ test('duplicate import deduplicates source identity across profiles and restores
     assert.equal(f.adapter.startedTurns.length, 0)
     assert.equal((await runtime.listNativeSessions({ providerInstanceId: 'codex-secondary' })).sessions[0].importedSessionId, first.sessionId)
   } finally { await f.cleanup() }
+})
+
+test('native import deduplication follows the current host and native resume binding', async (t) => {
+  const connection = { kind: 'ssh', host: 'native-import-test-host', runtimePath: '/remote/sessionflow' }
+  const cases = [
+    { name: 'SSH binding with a colliding native ID', connection, providerSessionId: 'native-thread-1', backendSessionId: 'native-thread-1', duplicate: false },
+    { name: 'local binding retired after returning from SSH', connection: undefined, duplicate: false },
+    { name: 'local replacement conversation after returning from SSH', connection: undefined, providerSessionId: 'replacement-native', backendSessionId: 'replacement-native', duplicate: false },
+    { name: 'preferred native ID changed while the backend fallback is stale', connection: undefined, providerSessionId: 'replacement-native', backendSessionId: 'native-thread-1', duplicate: false },
+    { name: 'local legacy binding retains its backend-only native ID', backendSessionId: 'native-thread-1', duplicate: true },
+  ]
+  for (const scenario of cases) await t.test(scenario.name, async () => {
+    const f = fixture()
+    try {
+      const firstRuntime = f.runtime()
+      const first = await firstRuntime.importNativeSession(f.input)
+      const state = structuredClone(first.state)
+      const moved = state.sessions[first.sessionId]
+      if (!scenario.duplicate) {
+        bindSessionWorkspaceConnection(moved, connection)
+        if (!scenario.connection) bindSessionWorkspaceConnection(moved, { kind: 'local' })
+      }
+      delete moved.providerSessionId
+      delete moved.backendSessionId
+      if (scenario.providerSessionId) moved.providerSessionId = scenario.providerSessionId
+      if (scenario.backendSessionId) moved.backendSessionId = scenario.backendSessionId
+      const origin = structuredClone(moved.nativeSessionOrigin)
+      // Reload the moved binding without an SSH probe or a provider turn.
+      const restoredFile = path.join(f.root, 'moved-runtime-state.json')
+      fs.writeFileSync(restoredFile, JSON.stringify(state))
+      const restored = f.runtime({ storageFile: restoredFile })
+      assert.deepEqual(restored.getState().sessions[first.sessionId].nativeSessionOrigin, origin)
+      const expectedId = scenario.duplicate ? first.sessionId : undefined
+      const listed = await restored.listNativeSessions({ providerInstanceId: f.input.providerInstanceId })
+      assert.equal(listed.sessions[0].importedSessionId, expectedId)
+      assert.equal((await restored.readNativeSession(f.input)).session.importedSessionId, expectedId)
+      const imported = await restored.importNativeSession(f.input)
+      assert.equal(imported.alreadyImported, scenario.duplicate)
+      if (scenario.duplicate) assert.equal(imported.sessionId, first.sessionId)
+      else assert.notEqual(imported.sessionId, first.sessionId)
+      assert.equal(imported.state.nodes.length, scenario.duplicate ? 1 : 2)
+      assert.deepEqual(imported.state.sessions[first.sessionId].nativeSessionOrigin, origin)
+      assert.equal(f.adapter.startedTurns.length, 0)
+    } finally { await f.cleanup() }
+  })
 })
 
 test('an existing runtime binding is recognized without origin metadata', async () => {

@@ -18,6 +18,7 @@ import {
 import { capitalizeFirst, formatFileSize, formatClock, formatClockSeconds } from '@/lib/format';
 import { termActionBtnCls } from '@/components/terminal';
 import { requestKindLabels } from '@/components/runtime-interaction-panel';
+import { CopyPromptButton } from '@/components/copy-prompt-button';
 
 const timelineRowContainmentStyle: CSSProperties = {
   contentVisibility: 'auto',
@@ -166,15 +167,14 @@ export const ChatMessage = memo(
 
     return (
       <div
-        className={cn('border-t border-ink-line-2 px-4 py-2.5 font-mono first:border-t-0', isCommentary ? 'bg-ink-soft/25 text-term-dim' : undefined)}
+        className={cn('px-4 py-3 font-sans', isUser ? 'flex justify-end' : 'text-term-name')}
+        data-message-role={message.role}
         data-message-phase={message.phase}
         style={isStreaming ? undefined : timelineRowContainmentStyle}
       >
-        <div className="mb-1.5 flex items-center gap-2">
-          {isUser ? (
-            <span className="text-[11px] text-term-faint">You</span>
-          ) : (
-            <>
+        <div className={cn('min-w-0', isUser ? 'group/prompt relative w-fit max-w-[min(85%,40rem)] pb-7' : 'w-full')}>
+          {!isUser ? (
+            <div className="mb-1.5 flex items-center gap-2 font-mono">
               <span
                 className={cn(
                   'size-1.5 rounded-full',
@@ -186,54 +186,61 @@ export const ChatMessage = memo(
               <span className={cn('text-[11px]', isCodex ? 'text-[#3941ff] dark:text-[#7a9dff]' : isCommentary ? 'text-term-dim2' : 'text-term-emerald')}>
                 {senderLabel}
               </span>
+              {isStreaming ? <span className="text-[10px] text-term-amber">Streaming</span> : null}
+              <span className="ml-auto text-[10.5px] tabular-nums text-term-faint">{formatClockSeconds(message.ts)}</span>
+            </div>
+          ) : null}
+          {isUser ? (
+            <>
+              <div className="min-w-0 rounded-[18px] bg-foreground/[0.055] px-4 py-2.5 text-left dark:bg-foreground/[0.08]">
+                {hasText ? (
+                  <div className="whitespace-pre-wrap break-words text-[14px] leading-6 text-term-name [overflow-wrap:anywhere]">{message.content}</div>
+                ) : null}
+                <MessageAttachmentStrip attachments={message.attachments} />
+              </div>
+              <div className="pointer-events-none absolute right-0 bottom-0 flex h-6 items-center gap-1.5 whitespace-nowrap text-term-dim2 opacity-0 transition-opacity group-hover/prompt:pointer-events-auto group-hover/prompt:opacity-100 group-has-[button:focus-visible]/prompt:pointer-events-auto group-has-[button:focus-visible]/prompt:opacity-100 has-[[data-copy-error=true]]:pointer-events-auto has-[[data-copy-error=true]]:opacity-100">
+                <time className="text-[11px] tabular-nums" dateTime={message.ts}>
+                  {formatClock(message.ts)}
+                </time>
+                {hasText ? <CopyPromptButton content={message.content} /> : null}
+              </div>
+            </>
+          ) : (
+            <>
+              {hasText || isStreaming ? (
+                <div className={cn('text-[13px] leading-6', isCommentary ? 'text-term-dim' : 'text-term-name')}>
+                  {isStreaming ? (
+                    <span className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]">{message.content}</span>
+                  ) : (
+                    <AgentMarkdown text={message.content} />
+                  )}
+                  {isStreaming ? <span className="orrery-caret ml-1" /> : null}
+                </div>
+              ) : null}
+              {isAssistant && !isStreaming ? (
+                <div className="mt-1.5 flex min-h-6 items-center gap-1" aria-label="Message actions">
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <span>
+                        <Button
+                          className="size-6 text-term-dim2 hover:text-term-name"
+                          variant="ghost"
+                          size="icon-sm"
+                          disabled={Boolean(forkReason) || forking || !onFork}
+                          aria-label="Fork from this message"
+                          onClick={() => onFork?.(message)}
+                        >
+                          {forking ? <RefreshCw className="size-3.5 animate-spin" /> : <GitFork className="size-3.5" />}
+                        </Button>
+                      </span>
+                    </TooltipTrigger>
+                    <TooltipContent>{forkReason ?? 'Fork chat from this message'}</TooltipContent>
+                  </Tooltip>
+                </div>
+              ) : null}
             </>
           )}
-          {isStreaming ? <span className="text-[10px] text-term-amber">Streaming</span> : null}
-          <span className="ml-auto text-[10.5px] tabular-nums text-term-faint">{formatClockSeconds(message.ts)}</span>
         </div>
-        {isUser ? (
-          <>
-            <div className="flex gap-2 text-[13px] leading-6">
-              <span className="shrink-0 text-term-accent-hi">❯</span>
-              <span className="whitespace-pre-wrap break-words text-term-name">{message.content}</span>
-            </div>
-            <MessageAttachmentStrip attachments={message.attachments} />
-          </>
-        ) : (
-          <>
-            {hasText || isStreaming ? (
-              <div className={cn('text-[13px] leading-6', isCommentary ? 'text-term-dim' : 'text-term-name')}>
-                {isStreaming ? (
-                  <span className="whitespace-pre-wrap break-words">{message.content}</span>
-                ) : (
-                  <AgentMarkdown text={message.content} />
-                )}
-                {isStreaming ? <span className="orrery-caret ml-1" /> : null}
-              </div>
-            ) : null}
-            {isAssistant && !isStreaming ? (
-              <div className="mt-1.5 flex min-h-6 items-center gap-1" aria-label="Message actions">
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <span>
-                      <Button
-                        className="size-6 text-term-dim2 hover:text-term-name"
-                        variant="ghost"
-                        size="icon-sm"
-                        disabled={Boolean(forkReason) || forking || !onFork}
-                        aria-label="Fork from this message"
-                        onClick={() => onFork?.(message)}
-                      >
-                        {forking ? <RefreshCw className="size-3.5 animate-spin" /> : <GitFork className="size-3.5" />}
-                      </Button>
-                    </span>
-                  </TooltipTrigger>
-                  <TooltipContent>{forkReason ?? 'Fork chat from this message'}</TooltipContent>
-                </Tooltip>
-              </div>
-            ) : null}
-          </>
-        )}
       </div>
     );
   },

@@ -43,7 +43,9 @@ shape in the conversation, the matching graph appears on the canvas
 automatically, ready to edit. Power users who want to design loops directly
 can do it in plain conversation too—no dragging boxes and wires.
 
-<img width="3202" height="1518" alt="SessionFlow-2" src="https://github.com/user-attachments/assets/cf02610e-0c44-4a1b-91cf-cb23a1a9d2b8" />
+<img width="1440" alt="SessionFlow welcome screen with project navigation and the new chat composer" src="./docs/images/sessionflow-workspace.jpg" />
+
+These screenshots show the current interface; workflow graphs use illustrative session data.
 
 A favorite pattern: throw one problem at several models at once—Codex, Claude
 Code, and Grok Build each draft a solution, read and challenge each other, and
@@ -127,7 +129,7 @@ One agent implements a change. Another reviews it and returns blocking issues.
 The findings reactivate the original session, which repairs the work and sends
 it back for another pass.
 
-<img width="3840" height="1986" alt="SessionFlow-review" src="https://github.com/user-attachments/assets/3af4c02e-aa7b-435c-b2e9-98997bae88d8" />
+<img width="1440" alt="SessionFlow review workflow with a coder, a reviewer, and a six-lap review loop" src="./docs/images/sessionflow-review.jpg" />
 
 
 The loop stops only when the Reviewer reports clean or a configured guardrail
@@ -138,7 +140,7 @@ is reached. Every lap, verdict, and return path remains visible.
 Run several agents or models as independent planners, let them read and
 challenge one another, and then synthesize the strongest result.
 
-<img width="3140" height="1532" alt="SessionFlow-discuss2" src="https://github.com/user-attachments/assets/a1bb358a-0e07-486e-8d9b-350aa57ec29a" />
+<img width="1440" alt="SessionFlow planning graph connecting Claude, Codex, and Grok planners to a synthesizer" src="./docs/images/sessionflow-plan-council.jpg" />
 
 The built-in **Plan Council** preserves the proposals, disagreements, peer
 reviews, and route to the final decision—not only the final answer. More complex
@@ -271,6 +273,10 @@ To run from source instead:
 npm install
 npm run dev
 ```
+
+On macOS, source launches use a cached `SessionFlow.app` in `.cache/dev-electron/`
+so the Dock shows the product name. Renderer updates still reload live; the
+installed Electron dependency and existing chat storage are unchanged.
 
 Generated design, verification, and acceptance artifacts use the repository's
 `outputs/` directory. Local artifacts are ignored by Git, apart from the existing

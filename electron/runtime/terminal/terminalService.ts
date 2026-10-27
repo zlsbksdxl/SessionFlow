@@ -104,6 +104,7 @@ export class TerminalService {
     if (!session) {
       throw new Error(`Unknown session: ${sessionId ?? ''}`)
     }
+    if (session.workspaceConnection?.kind === 'ssh') throw new Error('The embedded local terminal is unavailable for SSH chats. Use a terminal on the remote host.')
 
     const cwd = validateRunnableCwd(request.cwd ?? session.cwd)
     const existing = this.#runningTerminalForSession(sessionId, cwd)

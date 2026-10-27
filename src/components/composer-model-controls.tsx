@@ -13,6 +13,7 @@ type ComposerModelControlsProps = {
   discoveredModels?: ProviderSetupModel[];
   currentModelId?: string;
   disabled?: boolean;
+  normalizeReasoningEffort?: boolean;
   onModelChange: (model: string) => void;
   onReasoningEffortChange: (effort: ProviderReasoningEffort) => void;
 };
@@ -36,6 +37,7 @@ export function ComposerModelControls({
   discoveredModels,
   currentModelId,
   disabled,
+  normalizeReasoningEffort = true,
   onModelChange,
   onReasoningEffortChange,
 }: ComposerModelControlsProps) {
@@ -62,10 +64,18 @@ export function ComposerModelControls({
   // A refreshed live catalog can narrow the supported levels without changing
   // the model ID. Keep the draft settings valid when that happens as well.
   useEffect(() => {
-    if (selectedEffortIndex < 0 && defaultEffort) onReasoningEffortChange(defaultEffort.id);
-  }, [selectedEffortIndex, defaultEffort, onReasoningEffortChange]);
+    if (!disabled && normalizeReasoningEffort && selectedEffortIndex < 0 && defaultEffort) onReasoningEffortChange(defaultEffort.id);
+  }, [disabled, normalizeReasoningEffort, selectedEffortIndex, defaultEffort, onReasoningEffortChange]);
+
+  useEffect(() => {
+    if (disabled) {
+      setModelOpen(false);
+      setEffortOpen(false);
+    }
+  }, [disabled]);
 
   function chooseModel(nextModel: string) {
+    if (disabled) return;
     const nextModelId = nextModel.trim();
     const nextCatalogModel = discoveredModels?.find((entry) => entry.modelId === (nextModelId || currentModelId));
     const nextEffortOptions = effortOptionsForModel(providerKind, nextCatalogModel);
@@ -76,6 +86,7 @@ export function ComposerModelControls({
   }
 
   function commitCustomModel() {
+    if (disabled) return;
     if (customDraft.trim() !== selectedModelId) chooseModel(customDraft);
   }
 
@@ -167,6 +178,7 @@ export function ComposerModelControls({
               <input
                 id={customInputId}
                 autoFocus
+                disabled={disabled}
                 value={customDraft}
                 placeholder="Enter model ID"
                 className="h-8 w-full rounded-lg bg-muted px-2.5 text-xs outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-term-accent-hi/50"

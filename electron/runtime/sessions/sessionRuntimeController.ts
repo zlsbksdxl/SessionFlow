@@ -49,6 +49,8 @@ import {
   recordTurnCheckpointDiff,
 } from '../workspace/sessionCheckpoints.js'
 import { gitOutput } from '../workspace/gitWorkspace.js'
+import { bindSessionWorkspaceConnection, workspaceTransitionPrompt } from './workspaceConnectionState.js'
+import { workspaceConnectionKey } from '../workspace/remoteWorkspace.js'
 
 function createLifecycleAbortSignal() {
   let resolve!: () => void
@@ -61,8 +63,8 @@ function createLifecycleAbortSignal() {
 export type RuntimeRun = JsonRecord & {
   kill: () => boolean
   on: (event: string, listener: (...args: any[]) => void) => RuntimeRun
-  respondRuntimeRequest?: (input: JsonRecord) => JsonRecord | void
-  answerUserInput?: (input: JsonRecord) => JsonRecord | void
+  respondRuntimeRequest?: (input: JsonRecord) => JsonRecord | void | Promise<JsonRecord | void>
+  answerUserInput?: (input: JsonRecord) => JsonRecord | void | Promise<JsonRecord | void>
 }
 
 export type SessionRuntimeHost = {
@@ -243,8 +245,10 @@ export class SessionRuntimeController {
   private runResource(sessionId, turnId) {
     const session = this.state.sessions[sessionId]
     const scopeId = this.resourceScopeId(sessionId)
-    let workspaceKey = path.resolve(session?.cwd ?? process.cwd())
+    const remote = session?.workspaceConnection?.kind === 'ssh'
+    let workspaceKey = remote ? JSON.stringify(['ssh', session.workspaceConnection.host, session.workspaceConnection.runtimePath, session.cwd]) : path.resolve(session?.cwd ?? process.cwd())
     try {
+      if (remote) throw new Error('Remote workspace keys are already scoped to their SSH connection.')
       workspaceKey = fs.realpathSync(workspaceKey)
     } catch {
       /* validated at provider launch */
@@ -535,6 +539,7 @@ export class SessionRuntimeController {
       channelReadSeqs = [],
       execution = undefined,
       providerOperation = undefined,
+      runtimeSettingsOverride = undefined,
     },
     runId,
     resource,
@@ -561,6 +566,7 @@ export class SessionRuntimeController {
       baseline: {},
     }
     try {
+      if (session.workspaceConnection?.kind === 'ssh') throw new Error('Remote workspaces do not use local Git baselines.')
       lease.baseline.head = gitOutput(session.cwd, ['rev-parse', 'HEAD'])
       lease.baseline.statusDigest = createHash('sha256')
         .update(gitOutput(session.cwd, ['status', '--porcelain=v1']))
@@ -665,13 +671,16 @@ export class SessionRuntimeController {
 
     let run
     try {
+      bindSessionWorkspaceConnection(session, session.workspaceConnection)
       run = this.providerService.startTurn({
         providerKind: session.providerKind,
         providerInstanceId: session.providerInstanceId,
         turnId: runId,
-        prompt,
+        prompt: workspaceTransitionPrompt(session, prompt),
         attachments,
         cwd: session.cwd,
+        workspaceConnection: session.workspaceConnection,
+        providerConnectionKey: session.providerConnectionKey,
         backendSessionId:
           runKind === 'resume' || runKind === 'goal-control'
             ? (session.providerSessionId ?? session.backendSessionId)
@@ -681,7 +690,7 @@ export class SessionRuntimeController {
           : undefined,
         providerResumeCursor: session.providerResumeCursor,
         sessionId,
-        runtimeSettings: session.runtimeSettings,
+        runtimeSettings: runtimeSettingsOverride ?? session.runtimeSettings,
         // The session's own inbox: providers grant read access up front so
         // channel deliveries never stall on a permission prompt (§4.2.5).
         // ensureChannelDir: the dir must exist (and be canonical) when the
@@ -749,6 +758,7 @@ export class SessionRuntimeController {
       current.exitCode = code
       current.signal = signal
       current.finishedAt = now()
+      if (code === 0 && !killed && this.runContext.get(sessionId)?.runProducedOutput) delete current.workspaceTransferContextPending
       current.updatedAt = current.finishedAt
       recordTurnCheckpointDiff(this.checkpointHost(), sessionId, current.finishedAt)
       this.appendTurnCompletedIfMissing(sessionId, current.finishedAt)
@@ -874,6 +884,7 @@ export class SessionRuntimeController {
     }
 
     const providerSessionId = event.providerSessionId.trim()
+    session.providerConnectionKey = workspaceConnectionKey(session.workspaceConnection)
     const resumeCursor = nonEmptyString(event.resumeCursor)
       ? event.resumeCursor
       : undefined
@@ -1668,6 +1679,7 @@ export class SessionRuntimeController {
     if (ctx.actor?.kind !== 'human') throw new Error('Only a human can merge worktree changes.')
     const sessionId = optionalTrimmedString(input.sessionId)
     const session = sessionId ? this.state.sessions[sessionId] : undefined
+    if (session?.workspaceConnection?.kind === 'ssh') throw new Error('Local worktree merging is unavailable for SSH chats.')
     if (!session || session.project?.workMode !== 'worktree' || !session.project.repoRoot) {
       throw new Error(`Session is not backed by a managed worktree: ${sessionId ?? ''}`)
     }
@@ -1819,6 +1831,7 @@ export class SessionRuntimeController {
       throw new Error('Only a human can clean up a managed worktree.')
     const sessionId = optionalTrimmedString(input.sessionId)
     const session = sessionId ? this.state.sessions[sessionId] : undefined
+    if (session?.workspaceConnection?.kind === 'ssh') throw new Error('Local worktree cleanup is unavailable for SSH chats.')
     if (!session || session.project?.workMode !== 'worktree' || !session.project.repoRoot) {
       throw new Error(`Session is not backed by a managed worktree: ${sessionId ?? ''}`)
     }

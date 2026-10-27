@@ -1,4 +1,8 @@
 import { normalizeCollaborationSessions } from '../collaboration/collaborationRecovery.js'
+import { migrateLegacyChatProjectMemberships, normalizeChatProjectMemberships, normalizeChatProjects } from '../sessions/chatProjectRuntime.js'
+import { normalizeChatProjectSectionReferences, normalizeChatProjectSections } from '../sessions/chatProjectManagementRuntime.js'
+import { normalizeWorkspaceConnection, validateRemoteWorkspaceCwd, workspaceConnectionKey } from '../workspace/remoteWorkspace.js'
+import { bindSessionWorkspaceConnection } from '../sessions/workspaceConnectionState.js'
 // Runtime state recovery: durable/legacy snapshot loading, storage-schema
 // normalization of every persisted slice (sessions, nodes, edges, clusters,
 // subscriptions, workflows, councils, barriers...), repair diagnostics, and
@@ -470,6 +474,8 @@ export function normalizeState(
       ? source.edges.map((edge) => normalizeEdge(edge))
       : [],
     sessions: {},
+    chatProjects: normalizeChatProjects(source.chatProjects, diagnostics),
+    chatProjectSections: normalizeChatProjectSections(source.chatProjectSections, diagnostics),
     providerInstances,
     providerSetupSnapshots,
     clusters: isObject(source.clusters)
@@ -615,6 +621,14 @@ export function normalizeState(
     state.nodes.push(nodeFromSession(session))
   }
 
+  const invalidChatProjectReferences = normalizeChatProjectMemberships(state, diagnostics)
+  normalizeChatProjectSectionReferences(state)
+  // Inspect source directly: spreading the empty-state fallback above already
+  // supplies the new marker and must not conceal an old snapshot's absence.
+  if (source.chatProjectMembershipVersion !== 1) {
+    migrateLegacyChatProjectMemberships(state, source, diagnostics, invalidChatProjectReferences)
+  }
+  state.chatProjectMembershipVersion = 1
   state.diagnostics = activePersistedDiagnostics(
     state,
     source.diagnostics,
@@ -640,7 +654,7 @@ export function activePersistedDiagnostics(state, diagnostics) {
           ? item.details.sessionId
           : undefined
       const session = sessionId ? state.sessions[sessionId] : undefined
-      return !session || !isValidCwd(session.cwd)
+      return !session || session.workspaceConnection?.kind !== 'ssh' && !isValidCwd(session.cwd)
     })
     .slice(-50)
 }
@@ -770,8 +784,10 @@ export function normalizeSession(
       `Provider instance ${providerInstanceId} is ${providerInstance.kind}, not ${providerKind}, for restored session ${sessionId}.`,
     )
   }
-  let cwd = safeCwd(value.cwd)
-  const cwdRepair = !isValidCwd(cwd)
+  const workspaceConnection = normalizeWorkspaceConnection(value.workspaceConnection)
+  const remoteWorkspace = workspaceConnection?.kind === 'ssh'
+  let cwd = remoteWorkspace ? validateRemoteWorkspaceCwd(value.cwd) : safeCwd(value.cwd)
+  const cwdRepair = !remoteWorkspace && !isValidCwd(cwd)
     ? cwdRepairCandidate(cwd, value)
     : undefined
   if (cwdRepair) {
@@ -795,7 +811,7 @@ export function normalizeSession(
       delete value.error
     }
   }
-  if (!isValidCwd(cwd)) {
+  if (!remoteWorkspace && !isValidCwd(cwd)) {
     diagnostics.push(
       diagnostic(
         'storage.cwd_invalid',
@@ -807,7 +823,7 @@ export function normalizeSession(
       value.error ??
       `Project folder is no longer available: ${cwd}. Restore the folder or start a linked chat with a valid cwd.`
   }
-  let project = normalizeSessionProject(value.project, cwd)
+  let project: JsonRecord = remoteWorkspace ? { name: optionalTrimmedString(value.project?.name) ?? cwd.split('/').filter(Boolean).at(-1) ?? cwd, cwd: validateRemoteWorkspaceCwd(value.project?.cwd ?? cwd), workMode: 'local' } : normalizeSessionProject(value.project, cwd)
   if (cwdRepair && project?.workMode === 'worktree') {
     project = {
       ...project,
@@ -872,8 +888,13 @@ export function normalizeSession(
     label: nonEmptyString(value.label)
       ? value.label
       : `${providerMetadata[providerKind].labelPrefix} ${sessionId.slice(0, 8)}`,
+    labelIsCustom: value.labelIsCustom === true,
     prompt: typeof value.prompt === 'string' ? value.prompt : '',
     cwd,
+    workspaceConnection,
+    providerConnectionKey: optionalTrimmedString(value.providerConnectionKey) ?? workspaceConnectionKey(workspaceConnection),
+    providerConnectionHistory: Array.isArray(value.providerConnectionHistory) ? value.providerConnectionHistory.filter((binding) => isObject(binding) && nonEmptyString(binding.connectionKey) && nonEmptyString(binding.changedAt)).slice(-20).map((binding) => ({ connectionKey: binding.connectionKey, providerSessionId: optionalTrimmedString(binding.providerSessionId), backendSessionId: optionalTrimmedString(binding.backendSessionId), providerResumeCursor: optionalTrimmedString(binding.providerResumeCursor), changedAt: binding.changedAt })) : undefined,
+    workspaceTransferContextPending: value.workspaceTransferContextPending === true,
     project,
     role: value.role === 'master' ? 'master' : 'worker',
     status,
@@ -955,6 +976,7 @@ export function normalizeSession(
     )
   }
 
+  bindSessionWorkspaceConnection(session, workspaceConnection)
   return session
 }
 

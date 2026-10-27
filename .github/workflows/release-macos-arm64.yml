@@ -5,9 +5,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Stable release version, for example 0.2.1'
+        description: 'Stable release version, for example 0.3.0'
         required: true
-        default: '0.2.1'
+        default: '0.3.0'
         type: string
       signed:
         description: 'Use Developer ID signing and Apple notarization (requires all Apple credentials)'

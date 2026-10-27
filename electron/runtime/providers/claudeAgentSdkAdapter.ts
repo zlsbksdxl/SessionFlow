@@ -169,6 +169,33 @@ export function effectiveClaudeRuntimeConfig(runtimeSettings) {
   }
 }
 
+export async function configureClaudeRuntimeForTurn(query, runtimeSettings: Record<string, any> = {}) {
+  const permissionMode = claudePermissionModeForRuntime(runtimeSettings)
+  if (typeof query?.setPermissionMode === 'function') {
+    await query.setPermissionMode(permissionMode)
+  }
+  if (typeof query?.setModel !== 'function') {
+    throw new Error('This Claude SDK cannot apply model settings to an existing chat. Update the provider before continuing.')
+  }
+  await query.setModel(nonEmptyString(runtimeSettings.model) ? runtimeSettings.model.trim() : undefined)
+}
+
+export function claudeControllerForTurn(current, previousSettings, input, createController, previousCwd = input.cwd) {
+  const next = input.runtimeSettings ?? {}
+  if (
+    current &&
+    previousCwd === input.cwd &&
+    (previousSettings?.runtimeMode === 'full-access') === (next.runtimeMode === 'full-access') &&
+    (previousSettings?.sandbox === 'read-only') === (next.sandbox === 'read-only')
+  ) {
+    return current
+  }
+  // Workspace cwd, bypass opt-in, and read-only disallowedTools are initialization options.
+  // Reopen the same native conversation when those boundaries change.
+  current?.close()
+  return createController(input)
+}
+
 function isClaudeEditTool(toolName) {
   return [
     'Edit',
@@ -1051,6 +1078,7 @@ class ClaudeAgentSdkSessionController {
   async #configureRuntimeForTurn(turn) {
     const runtimeSettings = turn.input.runtimeSettings ?? {}
     const effectiveRuntimeConfig = effectiveClaudeRuntimeConfig(runtimeSettings)
+    await configureClaudeRuntimeForTurn(this.#query, runtimeSettings)
     turn.run.emit('providerEvent', {
       id: randomUUID(),
       ts: new Date().toISOString(),
@@ -1059,13 +1087,6 @@ class ClaudeAgentSdkSessionController {
       effectiveRuntimeConfig,
     })
 
-    const permissionMode = effectiveRuntimeConfig.native.permissionMode
-    if (
-      typeof permissionMode === 'string' &&
-      typeof this.#query?.setPermissionMode === 'function'
-    ) {
-      await this.#query.setPermissionMode(permissionMode)
-    }
   }
 
   #handleUserDialog(request, options) {
@@ -1278,23 +1299,35 @@ export class ClaudeAgentSdkAdapter {
       throw new Error('Claude Agent SDK sessions require an Orrery session id.')
     }
 
-    let controller = this.#sessions.get(sessionKey)
-    if (!controller) {
-      controller = new ClaudeAgentSdkSessionController({
+    const previous = this.#sessions.get(sessionKey)
+    const controller = claudeControllerForTurn(previous?.controller, previous?.runtimeSettings, input, (nextInput) => {
+      const created = new ClaudeAgentSdkSessionController({
         sessionKey,
-        input,
-        onClose: (closedSessionKey) => this.#sessions.delete(closedSessionKey),
+        input: nextInput,
+        onClose: (closedSessionKey) => {
+          if (this.#sessions.get(closedSessionKey)?.controller === created) {
+            this.#sessions.delete(closedSessionKey)
+          }
+        },
       })
-      this.#sessions.set(sessionKey, controller)
-    }
+      return created
+    }, previous?.cwd)
+    this.#sessions.set(sessionKey, { controller, runtimeSettings: { ...input.runtimeSettings }, cwd: input.cwd })
 
     return new ClaudeAgentSdkTurnRun(controller, input)
   }
 
   closeAll() {
-    for (const controller of this.#sessions.values()) {
-      controller.close()
+    for (const entry of this.#sessions.values()) {
+      entry.controller.close()
     }
     this.#sessions.clear()
+  }
+
+  closeSession(sessionId: string) {
+    const entry = this.#sessions.get(sessionId)
+    if (!entry) return
+    entry.controller.close()
+    this.#sessions.delete(sessionId)
   }
 }

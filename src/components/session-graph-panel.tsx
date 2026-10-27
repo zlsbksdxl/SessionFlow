@@ -1,7 +1,8 @@
-import { Background, BackgroundVariant, Controls, MiniMap, ReactFlow, type Connection, type ReactFlowInstance } from '@xyflow/react';
-import { Activity, Bot, FileText, MessageSquarePlus, PanelRightClose, Plus, Webhook, Workflow } from 'lucide-react';
+import { Background, BackgroundVariant, Controls, ReactFlow, type Connection, type ReactFlowInstance } from '@xyflow/react';
+import { Activity, Bot, Check, Ellipsis, FileText, MessageSquarePlus, PanelRightClose, Plus, Webhook, Workflow } from 'lucide-react';
 import { DropdownMenu } from 'radix-ui';
 import { Button } from '@/components/ui/button';
+import { PaneHeader } from '@/components/pane-header';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { cn } from '@/lib/utils';
 import { capitalizeFirst } from '@/lib/format';
@@ -24,6 +25,7 @@ import type { DraftEdgeData } from '@/lib/draft-graph-view';
 import { useAgentConnection } from '@/hooks/use-agent-connection';
 import { AgentConnectionPanel } from '@/components/agent-connection-panel';
 import { RelationshipInspectorPanel } from '@/components/relationship-inspector-panel';
+import { CanvasMinimap } from '@/components/canvas-minimap';
 
 type SessionGraphPanelProps = {
   core: RuntimeCoreState;
@@ -200,13 +202,12 @@ export function SessionGraphPanel({
 
   return (
     <section className="flex min-w-0 flex-1 flex-col bg-background" style={{ minWidth: canvasPanelMinWidth }}>
-      <header className="flex h-14 shrink-0 items-center justify-between border-b border-border px-4 font-mono">
+      <PaneHeader className="justify-between gap-3 px-4 font-mono">
         <div className="flex min-w-0 items-center gap-3">
           <span className="flex shrink-0 items-center gap-2 text-[12px] text-foreground">
             <Activity className="size-4 text-accent-ink" />
             Agent graph
           </span>
-          <span className="truncate text-[12px] text-muted-foreground">Code-agent chats and handoffs</span>
         </div>
 
         <div className="flex shrink-0 items-center gap-2">
@@ -214,7 +215,7 @@ export function SessionGraphPanel({
             <DropdownMenu.Trigger asChild>
               <Button
                 className="app-region-no-drag size-8"
-                variant={draft.graph.nodeOrder.length > 0 || isWorkflowLibraryOpen ? 'secondary' : 'outline'}
+                variant={draft.graph.nodeOrder.length > 0 || isWorkflowLibraryOpen ? 'secondary' : 'ghost'}
                 size="icon"
                 aria-label="Add agent or workflow"
                 title="Add agent or workflow"
@@ -254,31 +255,42 @@ export function SessionGraphPanel({
             </DropdownMenu.Portal>
           </DropdownMenu.Root>
 
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                variant={isSourcesOpen ? 'secondary' : 'ghost'}
-                size="icon"
-                disabled={!runtimeApi}
-                aria-label="Advanced event sources"
-                onClick={() => setIsSourcesOpen((open) => !open)}
-              >
-                <Webhook className="size-3.5" />
+          <DropdownMenu.Root>
+            <DropdownMenu.Trigger asChild>
+              <Button className="app-region-no-drag" variant="ghost" size="icon" aria-label="Agent graph options" title="Agent graph options">
+                <Ellipsis className="size-4" />
               </Button>
-            </TooltipTrigger>
-            <TooltipContent>Advanced event sources</TooltipContent>
-          </Tooltip>
-
-          <Button
-            className="h-8 font-mono text-[11px] tracking-[0.08em]"
-            variant={isDiffPanelOpen ? 'secondary' : 'outline'}
-            size="sm"
-            disabled={!canOpenDiffPanel}
-            onClick={openWorkingTreeDiff}
-          >
-            <FileText className="size-3.5" />
-            <span className="truncate">Diff</span>
-          </Button>
+            </DropdownMenu.Trigger>
+            <DropdownMenu.Portal>
+              <DropdownMenu.Content
+                align="end"
+                sideOffset={6}
+                collisionPadding={8}
+                className="app-region-no-drag z-50 min-w-52 rounded-xl border border-border bg-popover p-1 text-popover-foreground shadow-lg"
+              >
+                <DropdownMenu.CheckboxItem
+                  className="flex h-8 cursor-default select-none items-center gap-2 rounded-lg px-2 text-[13px] outline-none data-[disabled]:pointer-events-none data-[disabled]:opacity-35 data-[highlighted]:bg-muted"
+                  disabled={!runtimeApi}
+                  checked={isSourcesOpen}
+                  onCheckedChange={setIsSourcesOpen}
+                >
+                  <Webhook className="size-4 shrink-0" />
+                  <span className="flex-1">Advanced event sources</span>
+                  <DropdownMenu.ItemIndicator>
+                    <Check className="size-3.5" />
+                  </DropdownMenu.ItemIndicator>
+                </DropdownMenu.CheckboxItem>
+                <DropdownMenu.Item
+                  className="flex h-8 cursor-default select-none items-center gap-2 rounded-lg px-2 text-[13px] outline-none data-[disabled]:pointer-events-none data-[disabled]:opacity-35 data-[highlighted]:bg-muted"
+                  disabled={!canOpenDiffPanel}
+                  onSelect={openWorkingTreeDiff}
+                >
+                  <FileText className="size-4 shrink-0" />
+                  Diff
+                </DropdownMenu.Item>
+              </DropdownMenu.Content>
+            </DropdownMenu.Portal>
+          </DropdownMenu.Root>
 
           <Tooltip>
             <TooltipTrigger asChild>
@@ -288,16 +300,14 @@ export function SessionGraphPanel({
             </TooltipTrigger>
             <TooltipContent>Hide Agent graph</TooltipContent>
           </Tooltip>
-
         </div>
-      </header>
+      </PaneHeader>
 
       <div className="flex min-h-0 flex-1">
         <div
           className="relative min-h-0 flex-1"
           onPointerDownCapture={(event) => {
-            const sourceHandle =
-              event.target instanceof Element ? event.target.closest<HTMLElement>('.react-flow__handle.source') : null;
+            const sourceHandle = event.target instanceof Element ? event.target.closest<HTMLElement>('.react-flow__handle.source') : null;
             const sourceNodeId = sourceHandle?.dataset.nodeid;
             if (!sourceNodeId) return;
             connectionHandledRef.current = false;
@@ -428,6 +438,7 @@ export function SessionGraphPanel({
           ) : null}
           <ReactFlow
             colorMode={colorScheme}
+            proOptions={{ hideAttribution: true }}
             nodes={canvasNodes}
             edges={renderedEdges}
             nodeTypes={nodeTypes}
@@ -490,14 +501,7 @@ export function SessionGraphPanel({
           >
             <Background variant={BackgroundVariant.Dots} gap={24} size={1.2} />
             <Controls />
-            <MiniMap
-              pannable
-              zoomable
-              bgColor="var(--card)"
-              maskColor="color-mix(in oklch, var(--background) 55%, transparent)"
-              nodeColor="var(--muted)"
-              nodeStrokeColor="var(--border)"
-            />
+            <CanvasMinimap nodes={canvasNodes} edges={renderedEdges} colorMode={colorScheme} />
           </ReactFlow>
           {agentConnection.draft ? <AgentConnectionPanel runtimeState={runtimeState} connection={agentConnection} /> : null}
           {!agentConnection.draft && selectedRelationship ? (

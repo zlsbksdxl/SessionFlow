@@ -438,6 +438,8 @@ export class MembraneRequestRuntime {
           : defaultProviderInstanceForKind(requestedKind).providerInstanceId,
       prompt,
       cwd: sourceSession?.cwd,
+      ...(sourceSession?.workspaceConnection ? { workspaceConnection: clone(sourceSession.workspaceConnection) } : {}),
+      ...(sourceSession?.chatProjectId ? { chatProjectId: sourceSession.chatProjectId } : {}),
       context: input.context,
       contextTopic: input.contextTopic,
       cluster,

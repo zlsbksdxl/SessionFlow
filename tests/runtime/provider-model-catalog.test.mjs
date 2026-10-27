@@ -136,7 +136,7 @@ test('Claude auth command rejects contradictory authenticated JSON with a nonzer
   }
 });
 
-test('Claude provider keeps auth evidence but reports a bounded SDK initialization timeout', async () => {
+test('Claude provider keeps auth evidence but reports a bounded SDK initialization timeout', { timeout: 10_000 }, async () => {
   const fixture = createClaudeProbeFixture({
     loggedIn: true,
     authMethod: 'claude.ai',
@@ -148,13 +148,16 @@ test('Claude provider keeps auth evidence but reports a bounded SDK initializati
     const result = await probeClaudeProvider({
       providerInstance: fixture.providerInstance,
       cwd: fixture.tempRoot,
-      totalTimeoutMs: 500,
+      // The shared deadline includes two fixture process startups before SDK init.
+      totalTimeoutMs: 3_000,
       forceRefresh: true,
       queryFactory: () => ({
         initializationResult: () => new Promise(() => {}),
         close: () => { closed = true; },
       }),
     });
+    assert.equal(result.versionError, undefined);
+    assert.equal(result.authError, undefined);
     assert.equal(result.auth.status, 'authenticated');
     assert.match(result.protocolError, /Timed out initializing Claude Code/);
     assert.equal(result.protocolChecked, true);

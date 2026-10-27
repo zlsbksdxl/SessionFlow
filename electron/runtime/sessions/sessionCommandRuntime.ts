@@ -11,6 +11,8 @@ import {
   now,
   optionalTrimmedString,
   truncateForLog,
+  validProviderReasoningEfforts,
+  validProviderRuntimeModes,
   validRuntimeRequestDecisions,
 } from '../runtimeCommon.js'
 import {
@@ -48,6 +50,10 @@ import type { RuntimeRun } from './sessionRuntimeController.js'
 import { createSessionFork } from './sessionFork.js'
 import { threadGoalObjectiveMaxLength } from '../../../shared/thread-goal.js'
 import type { NativeSessionDetails } from '../../../shared/native-session.js'
+import { chatProjectForNewSession, moveChatToProject, upsertChatProject, workspaceMetadata } from './chatProjectRuntime.js'
+import { normalizeWorkspaceConnection, workspaceConnectionKey, validateRemoteWorkspaceCwd, testChatProjectConnection } from '../workspace/remoteWorkspace.js'
+import { renameChat } from './chatRenameRuntime.js'
+import { updateChatProject, archiveChatProjectChats, removeChatProject, upsertChatProjectSection, removeChatProjectSection } from './chatProjectManagementRuntime.js'
 
 const defaultPrompt =
   'You are running under Orrery P1 live session verification. Reply with one short sentence confirming the provider connection is working, then stop.'
@@ -74,6 +80,7 @@ export interface SessionCommandRuntimeHost {
   checkpointHost(): CheckpointHost
   humanCtx(): JsonRecord
   reviveDirectProviderRuntime(): void
+  providerRuntimeLifecycleEpoch(): number
   workflowDeploymentCrashAfterResourceCreate(): boolean
   getState(): JsonRecord
   checkpointChannelMutation(sessionId: string): void
@@ -121,6 +128,7 @@ export class SessionCommandRuntime {
   }
 
   async cmdSetThreadGoal(input: JsonRecord = {}, ctx: JsonRecord) {
+    if (input.workspaceConnection?.kind === 'ssh' || this.#host.state().sessions[input.sessionId]?.workspaceConnection?.kind === 'ssh' || this.#host.state().chatProjects?.[input.chatProjectId]?.connection?.kind === 'ssh') throw new Error('Native thread goals are not available for SSH chats yet.')
     if (ctx.actor?.kind !== 'human') {
       throw new Error('Only a human can control a thread goal.')
     }
@@ -482,6 +490,7 @@ export class SessionCommandRuntime {
     ctx: JsonRecord,
     options: JsonRecord = {},
   ) {
+    const createLifecycleEpoch = this.#host.providerRuntimeLifecycleEpoch()
     const deferStart = options.deferStart === true
     const sessionId = randomUUID()
     const role = input.role === 'master' ? 'master' : 'worker'
@@ -513,10 +522,16 @@ export class SessionCommandRuntime {
     const runtimeSettings = normalizeProviderRuntimeSettings(
       input.runtimeSettings,
     )
+    const projectSelection = chatProjectForNewSession(this.#host.state(), input)
+    const selectedProject = projectSelection instanceof Promise ? await projectSelection : projectSelection
+    if (createLifecycleEpoch !== this.#host.providerRuntimeLifecycleEpoch()) throw new Error('Provider run launch was cancelled by runtime shutdown.')
     let workspace
-    if (normalizeWorkMode(input.workMode) === 'worktree') {
+    if (selectedProject.workspaceConnection?.kind === 'ssh') {
+      if (normalizeWorkMode(input.workMode) === 'worktree') throw new Error('Managed worktrees are unavailable for SSH chats. Choose the existing remote directory.')
+      workspace = workspaceMetadata(selectedProject.cwd, selectedProject.workspaceConnection)
+    } else if (normalizeWorkMode(input.workMode) === 'worktree') {
       const worktreePlan = planSessionWorktree(
-        input.cwd,
+        selectedProject.cwd,
         sessionId,
         input.branch,
       )
@@ -534,7 +549,7 @@ export class SessionCommandRuntime {
         throw error
       }
     } else {
-      workspace = localSessionWorkspace(input.cwd, input.branch)
+      workspace = localSessionWorkspace(selectedProject.cwd, input.branch)
     }
     const cwd = workspace.cwd
 
@@ -594,6 +609,9 @@ export class SessionCommandRuntime {
       prompt: initialContent,
       cwd,
       project: workspace.project,
+      ...(selectedProject.chatProjectId ? { chatProjectId: selectedProject.chatProjectId } : {}),
+      ...(selectedProject.workspaceConnection ? { workspaceConnection: selectedProject.workspaceConnection } : {}),
+      providerConnectionKey: workspaceConnectionKey(selectedProject.workspaceConnection),
       role,
       status: deferStart ? 'idle' : 'pending',
       createdAt: ts,
@@ -675,6 +693,7 @@ export class SessionCommandRuntime {
         clusterId: cluster,
         sourceSessionId,
         cwd,
+        ...(selectedProject.chatProjectId ? { chatProjectId: selectedProject.chatProjectId } : {}),
       },
       ctx,
       {
@@ -758,6 +777,10 @@ export class SessionCommandRuntime {
 
   async cmdResumeSession(input: JsonRecord = {}, ctx: JsonRecord) {
     const sessionId = input.sessionId
+    const settingsPatchProvided = Object.hasOwn(input, 'runtimeSettings')
+    if (settingsPatchProvided && ctx.actor?.kind !== 'human') {
+      throw new Error('Only a human can edit runtime settings when continuing a chat.')
+    }
     this.assertActivatable(sessionId, ctx)
 
     const message =
@@ -766,6 +789,17 @@ export class SessionCommandRuntime {
         : undefined
     if (!message) {
       throw new Error('Resume message is required')
+    }
+
+    const session = this.#host.state().sessions[sessionId]
+    let runtimeSettingsOverride
+    if (settingsPatchProvided) {
+      if (session.status !== 'idle' && session.status !== 'failed') {
+        throw new Error('Runtime settings can be edited only while a chat is idle or failed.')
+      }
+      const settings = this.#resumeRuntimeSettings(session, input.runtimeSettings)
+      session.runtimeSettings = settings.stored
+      runtimeSettingsOverride = settings.forTurn
     }
 
     const context =
@@ -791,8 +825,61 @@ export class SessionCommandRuntime {
       attachments: normalizeChatAttachments(input.attachments),
       edgeSourceSessionId: optionalTrimmedString(input.edgeSourceSessionId),
       edgeInput: input,
+      ...(runtimeSettingsOverride ? { runtimeSettingsOverride } : {}),
       ctx,
     })
+  }
+
+  #resumeRuntimeSettings(session: JsonRecord, patch: unknown) {
+    if (!isObject(patch)) throw new Error('Runtime settings must be an object.')
+    const allowed = new Set(['runtimeMode', 'model', 'reasoningEffort'])
+    for (const field of Object.keys(patch)) {
+      if (!allowed.has(field)) throw new Error(`Runtime settings field is not editable: ${field}.`)
+    }
+    if (Object.hasOwn(patch, 'runtimeMode') && !validProviderRuntimeModes.has(patch.runtimeMode)) {
+      throw new Error('Invalid runtime mode.')
+    }
+    if (Object.hasOwn(patch, 'model') && typeof patch.model !== 'string') {
+      throw new Error('Runtime settings model must be a string; use an empty string for the provider default.')
+    }
+    if (Object.hasOwn(patch, 'reasoningEffort')) {
+      if (!validProviderReasoningEfforts.has(patch.reasoningEffort)) {
+        throw new Error('Invalid reasoning effort.')
+      }
+      if (session.providerKind === 'claude-code') {
+        throw new Error('Reasoning effort controls are not supported for Claude chats.')
+      }
+      if (session.providerKind === 'grok' && patch.reasoningEffort === 'xhigh') {
+        throw new Error('Grok does not support xhigh reasoning effort.')
+      }
+    }
+    const merged = { ...session.runtimeSettings, ...patch }
+    if (Object.hasOwn(patch, 'runtimeMode') && patch.runtimeMode !== session.runtimeSettings?.runtimeMode) {
+      delete merged.approvalPolicy
+      delete merged.sandbox
+    }
+    const stored = normalizeProviderRuntimeSettings(merged)
+    if (Object.hasOwn(patch, 'model') && !patch.model.trim() && session.providerKind !== 'claude-code') {
+      // Resuming a native thread without a model override can inherit its old
+      // model. Resolve a verified profile default for this turn explicitly,
+      // while retaining an empty stored override for the composer's Default.
+      const catalog = this.#host.state().providerModelCatalogs?.[session.providerInstanceId]
+      const fetchedAt = Date.parse(catalog?.fetchedAt ?? '')
+      const models = Array.isArray(catalog?.availableModels) ? catalog.availableModels : []
+      const defaultId = optionalTrimmedString(catalog?.defaultModelId) ??
+        optionalTrimmedString(models.find((model) => model.isDefault === true)?.modelId)
+      if (
+        catalog?.providerKind !== session.providerKind ||
+        catalog?.providerInstanceId !== session.providerInstanceId ||
+        catalog?.source !== 'live' || catalog?.stale === true || catalog?.error ||
+        !Number.isFinite(fetchedAt) || fetchedAt > Date.now() || Date.now() - fetchedAt >= 5 * 60 * 1000 ||
+        !defaultId || !models.some((model) => model.modelId === defaultId)
+      ) {
+        throw new Error('The provider default model is not verified for this profile. Refresh provider setup or choose an explicit model before sending.')
+      }
+      return { stored, forTurn: { ...stored, model: defaultId } }
+    }
+    return { stored, forTurn: undefined }
   }
 
   cmdDeliver(input: JsonRecord = {}, ctx: JsonRecord) {
@@ -909,6 +996,10 @@ export class SessionCommandRuntime {
       throw new Error(`Frozen session cannot be resumed: ${sessionId}`)
     }
     this.#host.assertBudgetAvailable(sessionId, ctx)
+    if (session.workspaceConnection?.kind === 'ssh') {
+      session.cwd = validateRemoteWorkspaceCwd(session.cwd)
+      return
+    }
     try {
       session.cwd = validateRunnableCwd(session.cwd)
     } catch (error) {
@@ -1036,6 +1127,7 @@ export class SessionCommandRuntime {
       attachments = [],
       edgeSourceSessionId,
       edgeInput = {},
+      runtimeSettingsOverride = undefined,
       ctx,
       subscriptionId,
       slotKey,
@@ -1154,6 +1246,7 @@ export class SessionCommandRuntime {
       userMessageId: userMessage.id,
       activationEventId: activatedEvent?.id,
       channelReadSeqs: listedSeqs,
+      ...(runtimeSettingsOverride ? { runtimeSettingsOverride: clone(runtimeSettingsOverride) } : {}),
       ...(validateExecutionEnvelope(ctx.execution)
         ? { execution: clone(ctx.execution) }
         : {}),
@@ -1166,6 +1259,28 @@ export class SessionCommandRuntime {
     const normalized = typeof input === 'string' ? { sessionId: input } : input
     return this.cmdArchiveSession(normalized, this.#host.humanCtx())
   }
+
+  cmdUpsertChatProject(input: JsonRecord = {}, ctx: JsonRecord) {
+    return upsertChatProject(this.#host, input, ctx)
+  }
+  async cmdTestChatProjectConnection(input: JsonRecord = {}, ctx: JsonRecord) {
+    if (ctx.actor?.kind !== 'human') throw new Error('Only a human can test project connections.')
+    return testChatProjectConnection({ ...input, cwd: input.cwd, connection: normalizeWorkspaceConnection(input.connection) })
+  }
+
+  cmdMoveChatToProject(input: JsonRecord = {}, ctx: JsonRecord) {
+    return moveChatToProject(this.#host, input, ctx)
+  }
+
+  cmdRenameChat(input: JsonRecord = {}, ctx: JsonRecord) {
+    return renameChat(this.#host, input, ctx)
+  }
+
+  cmdUpdateChatProject(input: JsonRecord = {}, ctx: JsonRecord) { return updateChatProject(this.#host, input, ctx) }
+  cmdArchiveChatProjectChats(input: JsonRecord = {}, ctx: JsonRecord) { return archiveChatProjectChats(this.#host, input, ctx) }
+  cmdRemoveChatProject(input: JsonRecord = {}, ctx: JsonRecord) { return removeChatProject(this.#host, input, ctx) }
+  cmdUpsertChatProjectSection(input: JsonRecord = {}, ctx: JsonRecord) { return upsertChatProjectSection(this.#host, input, ctx) }
+  cmdRemoveChatProjectSection(input: JsonRecord = {}, ctx: JsonRecord) { return removeChatProjectSection(this.#host, input, ctx) }
 
   cmdArchiveSession(input: JsonRecord = {}, ctx: JsonRecord) {
     const sessionId =
@@ -1349,31 +1464,36 @@ export class SessionCommandRuntime {
       requestId,
       decision: normalizedDecision,
     })
-    const providerDecision = isObject(providerResult)
-      ? providerResult.decision
-      : undefined
-    const appliedDecision = validRuntimeRequestDecisions.has(providerDecision)
-      ? normalizeRuntimeRequestDecision(providerDecision)
-      : normalizedDecision
-    const event = {
-      id: randomUUID(),
-      ts: now(),
-      type: 'request.resolved',
-      sessionId,
-      requestId,
-      status: runtimeRequestStatusForDecision(appliedDecision, request),
-    }
-    this.#host.appendExternalProviderRuntimeEvent(sessionId, event)
-    this.#host.appendKernelEvent(
-      'interaction.responded',
-      {
+    const finish = (providerResult: unknown) => {
+      const providerDecision = isObject(providerResult)
+        ? providerResult.decision
+        : undefined
+      const appliedDecision = validRuntimeRequestDecisions.has(providerDecision)
+        ? normalizeRuntimeRequestDecision(providerDecision)
+        : normalizedDecision
+      const event = {
+        id: randomUUID(),
+        ts: now(),
+        type: 'request.resolved',
         sessionId,
         requestId,
-        decision: appliedDecision,
-      },
-      ctx,
-    )
-    return { ok: true, state: this.#host.getState() }
+        status: runtimeRequestStatusForDecision(appliedDecision, request),
+      }
+      this.#host.appendExternalProviderRuntimeEvent(sessionId, event)
+      this.#host.appendKernelEvent(
+        'interaction.responded',
+        {
+          sessionId,
+          requestId,
+          decision: appliedDecision,
+        },
+        ctx,
+      )
+      return { ok: true, state: this.#host.getState() }
+    }
+    return providerResult && typeof providerResult.then === 'function'
+      ? Promise.resolve(providerResult).then(finish)
+      : finish(providerResult)
   }
 
   answerUserInput(input: JsonRecord = {}) {
@@ -1427,32 +1547,37 @@ export class SessionCommandRuntime {
       answer: primaryAnswer,
       answers,
     })
-    const canceled =
-      isObject(providerResult) && providerResult.outcome === 'cancelled'
-    const event = canceled
-      ? {
-          id: randomUUID(),
-          ts: now(),
-          type: 'user-input.resolved',
-          sessionId,
-          requestId,
-          status: 'canceled',
-        }
-      : {
-          id: randomUUID(),
-          ts: now(),
-          type: 'user-input.answered',
-          sessionId,
-          requestId,
-          answer: primaryAnswer,
-          ...(answers ? { answers } : {}),
-        }
-    this.#host.appendExternalProviderRuntimeEvent(sessionId, event)
-    this.#host.appendKernelEvent(
-      'interaction.answered',
-      { sessionId, requestId, outcome: canceled ? 'cancelled' : 'answered' },
-      ctx,
-    )
-    return { ok: true, state: this.#host.getState() }
+    const finish = (providerResult: unknown) => {
+      const canceled =
+        isObject(providerResult) && providerResult.outcome === 'cancelled'
+      const event = canceled
+        ? {
+            id: randomUUID(),
+            ts: now(),
+            type: 'user-input.resolved',
+            sessionId,
+            requestId,
+            status: 'canceled',
+          }
+        : {
+            id: randomUUID(),
+            ts: now(),
+            type: 'user-input.answered',
+            sessionId,
+            requestId,
+            answer: primaryAnswer,
+            ...(answers ? { answers } : {}),
+          }
+      this.#host.appendExternalProviderRuntimeEvent(sessionId, event)
+      this.#host.appendKernelEvent(
+        'interaction.answered',
+        { sessionId, requestId, outcome: canceled ? 'cancelled' : 'answered' },
+        ctx,
+      )
+      return { ok: true, state: this.#host.getState() }
+    }
+    return providerResult && typeof providerResult.then === 'function'
+      ? Promise.resolve(providerResult).then(finish)
+      : finish(providerResult)
   }
 }

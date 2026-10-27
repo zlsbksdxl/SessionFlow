@@ -89,6 +89,7 @@ export type CollaborationSession = {
   title: string
   cwd: string
   createdAt: string
+  chatProjectId?: string
   updatedAt: string
   archived: boolean
   members: CollaborationMember[]

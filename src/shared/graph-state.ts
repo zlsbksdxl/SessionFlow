@@ -40,6 +40,7 @@ import type {
 } from '@shared/resource-governance';
 import type { ThreadGoal } from '@shared/thread-goal';
 import type { NativeSessionOrigin } from '@shared/native-session';
+import type { ChatProject, ChatProjectSection, ChatProjectConnection } from '@shared/chat-projects';
 
 export const graphStateVersion = 8;
 
@@ -76,6 +77,9 @@ export const graphStateSchema = {
     nodes: 'GraphNode[]',
     edges: 'GraphEdge[]',
     sessions: 'Record<SessionId, AgentSession>',
+    chatProjects: 'Record<projectId, ChatProject>?; explicitly registered sidebar project directories',
+    chatProjectSections: 'Record<sectionId, ChatProjectSection>?; optional sidebar project sections',
+    chatProjectMembershipVersion: '1?; completed one-time migration of legacy workspace memberships',
     providerInstances: 'ProviderInstance[]; local provider runtime profiles',
     providerSetupSnapshots: 'Record<providerInstanceId, ProviderSetupSnapshot>; durable sanitized readiness cache with profile/cwd invalidation',
     clusters: 'Record<ClusterId, Cluster>; Cluster.nodeIds are the managed scope nodes',
@@ -210,6 +214,14 @@ export const graphStateSchema = {
         runtimeSettings: 'ProviderRuntimeSettings?; runtime mode, model, reasoning effort, sandbox/approval policy hints',
         effectiveRuntimeConfig: 'ProviderEffectiveRuntimeConfig?; provider-native runtime config actually applied by the adapter',
       },
+    },
+    resumeSession: {
+      input: {
+        base: 'ResumeRuntimeSessionInput; continue the original provider conversation',
+        runtimeSettings:
+          'Partial<Pick<ProviderRuntimeSettings, "runtimeMode" | "model" | "reasoningEffort">>?; human-only next-turn edits for idle/failed chats; omitted fields are preserved, empty model restores a verified provider default',
+      },
+      output: '{ ok, runId, state }; no new or forked provider conversation',
     },
     forkSession: {
       input: {
@@ -588,9 +600,15 @@ export type AgentSession = {
   providerFork?: PendingProviderFork;
   agent: string;
   label: string;
+  labelIsCustom?: boolean;
   prompt: string;
   cwd: string;
   project?: SessionProject;
+  chatProjectId?: string;
+  workspaceConnection?: ChatProjectConnection;
+  providerConnectionKey?: string;
+  providerConnectionHistory?: { connectionKey: string; providerSessionId?: string; backendSessionId?: string; providerResumeCursor?: string; changedAt: string }[];
+  workspaceTransferContextPending?: boolean;
   role: SessionRole;
   status: SessionStatus;
   createdAt: string;
@@ -1021,6 +1039,9 @@ export type GraphState = {
   nodes: GraphNode[];
   edges: GraphEdge[];
   sessions: Record<SessionId, AgentSession>;
+  chatProjects?: Record<string, ChatProject>;
+  chatProjectSections?: Record<string, ChatProjectSection>;
+  chatProjectMembershipVersion?: 1;
   providerInstances: ProviderInstance[];
   providerModelCatalogs?: Record<string, ProviderModelCatalog>;
   providerSetupSnapshots?: Record<string, ProviderSetupSnapshot>;
@@ -1051,6 +1072,8 @@ export type GraphState = {
 export type CreateRuntimeSessionInput = {
   prompt: string;
   cwd?: string;
+  chatProjectId?: string;
+  workspaceConnection?: ChatProjectConnection;
   workMode?: WorkMode;
   branch?: string;
   agent?: 'claude-code' | 'codex' | 'grok';
@@ -1182,6 +1205,7 @@ export type ResumeRuntimeSessionInput = {
   message: string;
   context?: string;
   attachments?: ChatAttachment[];
+  runtimeSettings?: Partial<Pick<ProviderRuntimeSettings, 'runtimeMode' | 'model' | 'reasoningEffort'>>;
 };
 
 export type SetThreadGoalInput = Omit<CreateRuntimeSessionInput, 'prompt' | 'attachments'> & {
@@ -1371,6 +1395,8 @@ export type WorkspaceFileContentResult = {
 export type OpenWorkspaceInput = {
   cwd: string;
   target: OpenWorkspaceTarget;
+  sessionId?: string;
+  workspaceConnection?: ChatProjectConnection;
 };
 
 export type OpenWorkspaceResult = {
@@ -1518,6 +1544,9 @@ export function createEmptyGraphState(): GraphState {
     nodes: [],
     edges: [],
     sessions: {},
+    chatProjects: {},
+    chatProjectSections: {},
+    chatProjectMembershipVersion: 1,
     providerInstances: defaultGraphProviderInstances.map((instance) => ({
       ...instance,
     })),

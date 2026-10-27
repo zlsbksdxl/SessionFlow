@@ -1,5 +1,16 @@
-import { memo } from 'react';
-import { BaseEdge, EdgeLabelRenderer, type Edge, type EdgeProps, type Node, type NodeProps, Position, getBezierPath } from '@xyflow/react';
+import { memo, useCallback } from 'react';
+import {
+  BaseEdge,
+  EdgeLabelRenderer,
+  NodeResizer,
+  type Edge,
+  type EdgeProps,
+  type Node,
+  type NodeProps,
+  type OnResizeEnd,
+  Position,
+  getBezierPath,
+} from '@xyflow/react';
 import { Activity, Bot, Clock, GitBranch, RotateCw, Snowflake, SquareTerminal, Webhook, Zap } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { TermChip } from '@/components/terminal';
@@ -20,27 +31,69 @@ import { statusLabels, statePillBase, nodeStatePillCls } from '@/lib/session-dis
 import { formatClock } from '@/lib/format';
 import { DraftAgentNode, DraftRelationshipEdge } from '@/components/draft-canvas';
 import { GraphHandle } from '@/components/graph-handle';
+import { AgentNodeMenu } from '@/components/agent-node-menu';
+import { agentNodeSizeBounds, defaultAgentNodeWidth, defaultAgentNodeHeight } from '@/lib/canvas-node-sizes';
 
-export const AgentNode = memo(function AgentNode({ data, selected }: NodeProps<Node<AgentNodeData>>) {
+export const AgentNode = memo(function AgentNode({ id, data, selected, width, height }: NodeProps<Node<AgentNodeData>>) {
   const isMaster = data.role === 'master';
   const freezeReason = data.freezeReason ?? data.masterReason;
   const AgentGlyph = data.providerKind ? agentIcons[data.providerKind] : Bot;
   const VendorGlyph = data.providerKind === 'grok' ? vendorIcons.grok : undefined;
   const modelFamily = modelFamilyIcon(data.model, data.providerKind);
+  const onResize = data.onResize;
+  const finishResize = useCallback<OnResizeEnd>((_event, { width, height, x, y }) => onResize?.(id, { width, height }, { x, y }), [id, onResize]);
   return (
     <div
       className={cn(
-        'w-[300px] rounded-xl border bg-card font-mono shadow-sm transition',
+        'group/agent flex h-full min-h-[140px] w-full min-w-0 flex-col rounded-xl border bg-card font-mono shadow-sm transition-colors focus-within:ring-2 focus-within:ring-term-accent-hi/50',
         data.frozen ? 'border-border bg-muted/50 opacity-75' : isMaster ? 'border-term-amber/50' : data.isManaged ? 'border-term-cyan/45' : 'border-border',
         selected && '!border-term-accent-hi/60 ring-2 ring-term-accent-hi/50',
       )}
     >
+      <NodeResizer
+        nodeId={id}
+        minWidth={agentNodeSizeBounds.minWidth}
+        maxWidth={agentNodeSizeBounds.maxWidth}
+        minHeight={agentNodeSizeBounds.minHeight}
+        maxHeight={agentNodeSizeBounds.maxHeight}
+        handleClassName="nopan z-20 !size-3 !border-0 !bg-transparent"
+        handleStyle={{ background: 'transparent', border: 0 }}
+        lineClassName="nopan z-10 !border-0 !bg-transparent [&.left]:!w-2 [&.right]:!w-2 [&.top]:!h-2 [&.bottom]:!h-2"
+        lineStyle={{ background: 'transparent', border: 0 }}
+        onResizeEnd={finishResize}
+      />
+      <button
+        type="button"
+        className="nodrag nopan sr-only"
+        aria-label={`Resize ${data.label}`}
+        title="Arrow keys resize; Shift uses larger steps. Home resets the size."
+        onClick={(event) => event.stopPropagation()}
+        onKeyDown={(event) => {
+          if (!data.onResize || event.altKey || event.ctrlKey || event.metaKey) return;
+          const step = event.shiftKey ? 24 : 12;
+          let nextWidth = width ?? defaultAgentNodeWidth;
+          let nextHeight = height ?? defaultAgentNodeHeight;
+          if (event.key === 'ArrowLeft') nextWidth -= step;
+          else if (event.key === 'ArrowRight') nextWidth += step;
+          else if (event.key === 'ArrowUp') nextHeight -= step;
+          else if (event.key === 'ArrowDown') nextHeight += step;
+          else if (event.key === 'Home') {
+            nextWidth = defaultAgentNodeWidth;
+            nextHeight = defaultAgentNodeHeight;
+          } else return;
+          event.preventDefault();
+          event.stopPropagation();
+          data.onResize(id, { width: nextWidth, height: nextHeight });
+        }}
+      >
+        Resize card
+      </button>
       <GraphHandle
         id="target-left"
         type="target"
         position={Position.Left}
         style={{ top: '62%' }}
-        className="!size-3 !border-2 !border-card"
+        className="!z-30 !size-3 !border-2 !border-card"
         aria-label={`Connect into ${data.label} from the left`}
       />
       <GraphHandle
@@ -48,10 +101,10 @@ export const AgentNode = memo(function AgentNode({ data, selected }: NodeProps<N
         type="source"
         position={Position.Left}
         style={{ top: '38%' }}
-        className="!size-3 !border-2 !border-card"
+        className="!z-30 !size-3 !border-2 !border-card"
         aria-label={`Connect from ${data.label} on the left`}
       />
-      <div className="flex items-center gap-2.5 px-3.5 pb-2.5 pt-3">
+      <div className="flex shrink-0 items-center gap-2.5 px-3.5 pb-2.5 pt-3">
         {/* The main glyph identifies the harness. Grok nodes add a vendor
             badge; the subline carries the model id with its family glyph. */}
         <div
@@ -88,60 +141,63 @@ export const AgentNode = memo(function AgentNode({ data, selected }: NodeProps<N
             {data.frozen ? 'Frozen' : isMaster ? 'Master' : statusLabels[data.status]}
           </span>
         ) : null}
+        <AgentNodeMenu label={data.label} onRemove={data.onRemoveFromGraph ? () => data.onRemoveFromGraph?.(id) : undefined} />
       </div>
 
-      {data.clusterLabel || data.isManaged ? (
-        <div className="flex flex-wrap gap-1.5 px-3.5 pb-2">
-          {data.clusterLabel ? <TermChip>{data.clusterLabel}</TermChip> : null}
-          {data.isManaged ? (
-            <span className="inline-flex items-center gap-1 rounded-md border border-cyan-500/30 bg-cyan-500/10 px-2 py-1 text-[10.5px] leading-none text-cyan-700 dark:text-cyan-300">
-              managed
-            </span>
-          ) : null}
-        </div>
-      ) : null}
-
-      <div className="px-3.5 pb-3">
-        {data.latestVerdict ? (
-          <>
-            <div
-              className={cn(
-                'flex items-center gap-2 rounded-lg border px-2.5 py-1.5 text-[10.5px] font-semibold tracking-[0.04em]',
-                data.latestVerdict === 'clean'
-                  ? 'border-term-accent/30 bg-term-accent/10 text-term-accent'
-                  : 'border-term-amber/40 bg-term-amber/10 text-term-amber',
-              )}
-            >
-              <span>{data.latestVerdict === 'clean' ? '✓' : '!'}</span>
-              <span className="truncate">
-                {data.latestVerdict}
-                {data.latestReportIssueCount !== undefined ? ` · ${data.latestReportIssueCount} issues` : ''}
+      <div className="nodrag nowheel min-h-0 flex-1 overflow-y-auto">
+        {data.clusterLabel || data.isManaged ? (
+          <div className="flex flex-wrap gap-1.5 px-3.5 pb-2">
+            {data.clusterLabel ? <TermChip>{data.clusterLabel}</TermChip> : null}
+            {data.isManaged ? (
+              <span className="inline-flex items-center gap-1 rounded-md border border-cyan-500/30 bg-cyan-500/10 px-2 py-1 text-[10.5px] leading-none text-cyan-700 dark:text-cyan-300">
+                managed
               </span>
-            </div>
-            {data.latestReportSummary ? (
-              <p className="mt-1.5 truncate text-[11px] leading-4 text-muted-foreground" title={data.latestReportSummary}>
-                {data.latestReportSummary}
-              </p>
             ) : null}
-          </>
-        ) : (
-          <div className="rounded-lg border border-border bg-muted/40 px-2.5 py-2">
-            <p className="line-clamp-2 break-words text-[11px] leading-5 text-muted-foreground">{data.description}</p>
-          </div>
-        )}
-
-        {data.frozen ? (
-          <div className="mt-2 rounded-lg border border-border bg-muted/40 px-2.5 py-2">
-            <div className="flex items-center gap-1.5 text-[10px] tracking-[0.12em] text-muted-foreground">
-              <Snowflake className="size-3" />
-              Freeze
-            </div>
-            {freezeReason ? <p className="mt-1 line-clamp-2 text-[11px] leading-4 text-muted-foreground">{freezeReason}</p> : null}
           </div>
         ) : null}
+
+        <div className="px-3.5 pb-3">
+          {data.latestVerdict ? (
+            <>
+              <div
+                className={cn(
+                  'flex items-center gap-2 rounded-lg border px-2.5 py-1.5 text-[10.5px] font-semibold tracking-[0.04em]',
+                  data.latestVerdict === 'clean'
+                    ? 'border-term-accent/30 bg-term-accent/10 text-term-accent'
+                    : 'border-term-amber/40 bg-term-amber/10 text-term-amber',
+                )}
+              >
+                <span>{data.latestVerdict === 'clean' ? '✓' : '!'}</span>
+                <span className="truncate">
+                  {data.latestVerdict}
+                  {data.latestReportIssueCount !== undefined ? ` · ${data.latestReportIssueCount} issues` : ''}
+                </span>
+              </div>
+              {data.latestReportSummary ? (
+                <p className="mt-1.5 break-words text-[11px] leading-4 text-muted-foreground" title={data.latestReportSummary}>
+                  {data.latestReportSummary}
+                </p>
+              ) : null}
+            </>
+          ) : (
+            <div className="rounded-lg border border-border bg-muted/40 px-2.5 py-2">
+              <p className="break-words text-[11px] leading-5 text-muted-foreground">{data.description}</p>
+            </div>
+          )}
+
+          {data.frozen ? (
+            <div className="mt-2 rounded-lg border border-border bg-muted/40 px-2.5 py-2">
+              <div className="flex items-center gap-1.5 text-[10px] tracking-[0.12em] text-muted-foreground">
+                <Snowflake className="size-3" />
+                Freeze
+              </div>
+              {freezeReason ? <p className="mt-1 break-words text-[11px] leading-4 text-muted-foreground">{freezeReason}</p> : null}
+            </div>
+          ) : null}
+        </div>
       </div>
 
-      <div className="flex items-center gap-1.5 border-t border-border px-3.5 py-2 text-[11px] text-muted-foreground">
+      <div className="flex shrink-0 items-center gap-1.5 border-t border-border px-3.5 py-2 text-[11px] text-muted-foreground">
         <Activity className="size-3 text-accent-ink" />
         <span className="tabular-nums text-foreground/80">{data.messageCount}</span>
         msgs
@@ -156,7 +212,7 @@ export const AgentNode = memo(function AgentNode({ data, selected }: NodeProps<N
         type="target"
         position={Position.Right}
         style={{ top: '62%' }}
-        className="!size-3 !border-2 !border-card"
+        className="!z-30 !size-3 !border-2 !border-card"
         aria-label={`Connect into ${data.label} from the right`}
       />
       <GraphHandle
@@ -164,7 +220,7 @@ export const AgentNode = memo(function AgentNode({ data, selected }: NodeProps<N
         type="source"
         position={Position.Right}
         style={{ top: '38%' }}
-        className="!size-3 !border-2 !border-card"
+        className="!z-30 !size-3 !border-2 !border-card"
         aria-label={`Connect from ${data.label} on the right`}
       />
     </div>

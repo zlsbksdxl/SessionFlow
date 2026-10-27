@@ -53,8 +53,8 @@ manifest from inside the output directory:
 
 ```sh
 cd outputs/release
-shasum -a 256 SessionFlow-0.2.1-mac-arm64.dmg SessionFlow-0.2.1-mac-arm64.zip \
-  SessionFlow-0.2.1-mac-arm64.dmg.blockmap SessionFlow-0.2.1-mac-arm64.zip.blockmap \
+shasum -a 256 SessionFlow-0.3.0-mac-arm64.dmg SessionFlow-0.3.0-mac-arm64.zip \
+  SessionFlow-0.3.0-mac-arm64.dmg.blockmap SessionFlow-0.3.0-mac-arm64.zip.blockmap \
   latest-mac.yml > SHA256SUMS
 shasum -a 256 -c SHA256SUMS
 ```
@@ -62,7 +62,7 @@ shasum -a 256 -c SHA256SUMS
 When publishing locally, create a draft for the exact verified commit, upload
 all six files, read back the assets and release notes, then publish the draft.
 Keep the public note: **Ad-hoc signed; no Developer ID signing or Apple
-notarization.** Use a stable version tag such as `v0.2.1`.
+notarization.** Use a stable version tag such as `v0.3.0`.
 
 ### Versioned branding transition
 

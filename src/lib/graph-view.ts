@@ -17,6 +17,7 @@ import { reportIssueCount, reportSummary } from '@/lib/reports';
 import { sessionLabel } from '@/lib/session-display';
 import { type ProviderKind } from '@shared/provider-metadata';
 import { deriveLoopProductView, type LoopProductView } from '@shared/loop-product';
+import { defaultAgentNodeHeight, defaultAgentNodeWidth, type CanvasNodeSizes } from '@/lib/canvas-node-sizes';
 
 export type AgentNodeData = {
   label: string;
@@ -36,6 +37,8 @@ export type AgentNodeData = {
   masterReason?: string;
   clusterLabel?: string;
   isManaged?: boolean;
+  onResize?: (nodeId: string, size: { width: number; height: number }, position?: { x: number; y: number }) => void;
+  onRemoveFromGraph?: (nodeId: string) => void;
 };
 
 // Canvas edge kinds: the four runtime-history kinds + declared links from
@@ -183,7 +186,7 @@ export function loopLastEvent(cluster: GraphState['clusters'][string] | undefine
   return [loopEventLabel(event.type), subject, formatClock(event.ts)].filter(Boolean).join(' · ');
 }
 
-export function clusterBoundaryNodes(state: GraphState): Node<ClusterNodeData>[] {
+export function clusterBoundaryNodes(state: GraphState, nodeSizes: CanvasNodeSizes = {}): Node<ClusterNodeData>[] {
   return Object.values(state.clusters).flatMap((cluster) => {
     const managedNodes = cluster.nodeIds
       .map((nodeId) => state.nodes.find((node) => node.nodeId === nodeId))
@@ -193,13 +196,11 @@ export function clusterBoundaryNodes(state: GraphState): Node<ClusterNodeData>[]
       return [];
     }
 
-    const nodeWidth = 300;
-    const nodeHeight = 240;
     const padding = 36;
     const minX = Math.min(...managedNodes.map((node) => node.position.x)) - padding;
     const minY = Math.min(...managedNodes.map((node) => node.position.y)) - padding;
-    const maxX = Math.max(...managedNodes.map((node) => node.position.x + nodeWidth)) + padding;
-    const maxY = Math.max(...managedNodes.map((node) => node.position.y + nodeHeight)) + padding;
+    const maxX = Math.max(...managedNodes.map((node) => node.position.x + (nodeSizes[node.nodeId]?.width ?? defaultAgentNodeWidth))) + padding;
+    const maxY = Math.max(...managedNodes.map((node) => node.position.y + (nodeSizes[node.nodeId]?.height ?? defaultAgentNodeHeight))) + padding;
     const master = cluster.masterSessionId ? state.sessions[cluster.masterSessionId] : undefined;
 
     return [
@@ -459,7 +460,7 @@ export function loopProductSessions(state: GraphState) {
   );
 }
 
-export function loopBadgeNodes(state: GraphState): Node<LoopBadgeData>[] {
+export function loopBadgeNodes(state: GraphState, nodeSizes: CanvasNodeSizes = {}): Node<LoopBadgeData>[] {
   return (state.loops ?? []).flatMap((loop) => {
     const members = loop.memberSessionIds
       .map((sessionId) => state.nodes.find((node) => node.nodeId === sessionId))
@@ -467,9 +468,8 @@ export function loopBadgeNodes(state: GraphState): Node<LoopBadgeData>[] {
     if (members.length === 0) {
       return [];
     }
-    const nodeWidth = 300;
     const minX = Math.min(...members.map((node) => node.position.x));
-    const maxX = Math.max(...members.map((node) => node.position.x + nodeWidth));
+    const maxX = Math.max(...members.map((node) => node.position.x + (nodeSizes[node.nodeId]?.width ?? defaultAgentNodeWidth)));
     const minY = Math.min(...members.map((node) => node.position.y));
     return [
       {

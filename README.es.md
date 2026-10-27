@@ -43,7 +43,9 @@ loop, el grafo correspondiente aparece en el canvas automáticamente, listo
 para editar. Quien quiera diseñar loops directamente también puede hacerlo en
 conversación normal—sin arrastrar cajas ni cables.
 
-<img width="3202" height="1518" alt="SessionFlow-2" src="https://github.com/user-attachments/assets/cf02610e-0c44-4a1b-91cf-cb23a1a9d2b8" />
+<img width="1440" alt="Pantalla de bienvenida de SessionFlow con navegación por proyectos y el compositor de un nuevo chat" src="./docs/images/sessionflow-workspace.jpg" />
+
+Estas capturas muestran la interfaz actual; los grafos de workflow usan datos de sesiones de ejemplo.
 
 Un patrón favorito: lanza el mismo problema a varios modelos a la vez—Codex,
 Claude Code y Grok Build redactan cada uno una solución, se leen y se desafían
@@ -130,7 +132,7 @@ Un Agent implementa un cambio. Otro lo revisa y devuelve los blocking issues.
 Los hallazgos reactivan la sesión original, que repara el trabajo y lo envía a
 otra pasada.
 
-<img width="3840" height="1986" alt="SessionFlow-review" src="https://github.com/user-attachments/assets/3af4c02e-aa7b-435c-b2e9-98997bae88d8" />
+<img width="1440" alt="Workflow de revisión de SessionFlow con un coder, un reviewer y un loop limitado a seis vueltas" src="./docs/images/sessionflow-review.jpg" />
 
 El loop solo se detiene cuando el Reviewer reporta clean o se alcanza una
 barrera configurada. Cada vuelta, cada verdict y cada camino de retorno queda
@@ -141,7 +143,7 @@ visible.
 Ejecuta varios Agents o modelos como planificadores independientes, deja que se
 lean y se desafíen entre sí, y sintetiza después el resultado más sólido.
 
-<img width="3140" height="1532" alt="SessionFlow-discuss2" src="https://github.com/user-attachments/assets/a1bb358a-0e07-486e-8d9b-350aa57ec29a" />
+<img width="1440" alt="Grafo de planificación de SessionFlow que conecta a los planificadores Claude, Codex y Grok con un sintetizador" src="./docs/images/sessionflow-plan-council.jpg" />
 
 El **Plan Council** integrado conserva las propuestas, los desacuerdos, las
 revisiones cruzadas y la ruta hasta la decisión final—no solo la respuesta

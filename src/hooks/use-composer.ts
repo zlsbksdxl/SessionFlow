@@ -1,7 +1,9 @@
 import { type ClipboardEvent as ReactClipboardEvent, type DragEvent as ReactDragEvent, useCallback, useEffect, useRef, useState } from 'react';
 
 import type { ChatAttachment } from '@/shared/provider-runtime';
+import type { AgentSession } from '@/shared/graph-state';
 import { composerAttachmentFromFile, insertPlainTextAtCaret } from '@/lib/attachments';
+import { composerAttachmentFromChat } from '@/lib/chat-context-attachment';
 
 export function useComposer({ setRuntimeError }: { setRuntimeError: (error: string | undefined) => void }) {
   const [message, setMessage] = useState('');
@@ -46,6 +48,19 @@ export function useComposer({ setRuntimeError }: { setRuntimeError: (error: stri
   const removeComposerAttachment = useCallback((id: string) => {
     setComposerAttachments((current) => current.filter((attachment) => attachment.id !== id));
   }, []);
+
+  const addComposerChat = useCallback(
+    (session: AgentSession) => {
+      const attachment = composerAttachmentFromChat(session);
+      if (!attachment) {
+        setRuntimeError('This chat has no completed messages to add.');
+        return;
+      }
+      setComposerAttachments((current) => (current.some((item) => item.id === attachment.id) ? current : [...current, attachment]));
+      setRuntimeError(undefined);
+    },
+    [setRuntimeError],
+  );
 
   const handleComposerPaste = useCallback(
     (event: ReactClipboardEvent<HTMLDivElement>) => {
@@ -107,6 +122,7 @@ export function useComposer({ setRuntimeError }: { setRuntimeError: (error: stri
     setComposerText,
     clearComposer,
     addComposerFiles,
+    addComposerChat,
     removeComposerAttachment,
     handleComposerPaste,
     handleComposerDrop,

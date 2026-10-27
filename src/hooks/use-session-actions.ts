@@ -1,4 +1,4 @@
-import { type Dispatch, type RefObject, type SetStateAction, useCallback, useState } from 'react';
+import { type Dispatch, type RefObject, type SetStateAction, useCallback, useMemo, useState } from 'react';
 
 import type { AgentMessage, AgentSession, GraphState, OpenWorkspaceTarget, WorkMode } from '@/shared/graph-state';
 import type { ChatAttachment, ProviderInstance, ProviderKind, ProviderReasoningEffort, ProviderRuntimeMode, RuntimePlan } from '@/shared/provider-runtime';
@@ -8,6 +8,10 @@ import { parseGoalComposerCommand, type GoalComposerCommand } from '@shared/thre
 import { defaultWorkspaceCwd, latestSessionCwd, validateProjectCwd } from '@/lib/workspace';
 import { providerOption, providerRuntimeSettingsDraft } from '@/lib/provider-catalog';
 import type { RailTab } from '@/lib/layout-prefs';
+import type { SessionComposerSettingsPatch } from '@/lib/session-composer-settings';
+import { projectIdForDraft, projectIdForSelectedCwd } from '@/lib/draft-chat-project';
+import type { ChatProject, ChatProjectConnection } from '@shared/chat-projects';
+import { chatComputerOptions, computerConnectionId, draftForComputer } from '@/lib/chat-computers';
 
 export function useSessionActions({
   runtimeApi,
@@ -47,10 +51,14 @@ export function useSessionActions({
     clearComposer: () => void;
     setComposerText: (text: string) => void;
     composerEditorRef: RefObject<HTMLDivElement | null>;
+    sessionRuntimeSettingsPatch?: SessionComposerSettingsPatch;
+    clearSessionSettings: (sessionId: string) => void;
   };
   newChat: {
     newCwd: string;
     setNewCwd: Dispatch<SetStateAction<string>>;
+    newWorkspaceConnection: ChatProjectConnection;
+    setNewWorkspaceConnection: Dispatch<SetStateAction<ChatProjectConnection>>;
     newWorkMode: WorkMode;
     setNewWorkMode: Dispatch<SetStateAction<WorkMode>>;
     newBranch: string;
@@ -63,10 +71,12 @@ export function useSessionActions({
     changeNewProviderKind: (providerKind: ProviderKind) => void;
   };
 }) {
-  const { message, composerAttachments, clearComposer, setComposerText, composerEditorRef } = composer;
+  const { message, composerAttachments, clearComposer, setComposerText, composerEditorRef, sessionRuntimeSettingsPatch, clearSessionSettings } = composer;
   const {
     newCwd,
     setNewCwd,
+    newWorkspaceConnection,
+    setNewWorkspaceConnection,
     newWorkMode,
     setNewWorkMode,
     newBranch,
@@ -83,36 +93,137 @@ export function useSessionActions({
   const [isResuming, setIsResuming] = useState(false);
   const [forkingMessageId, setForkingMessageId] = useState<string>();
   const [pendingLinkedSourceId, setPendingLinkedSourceId] = useState<string | null>(null);
+  const [newChatProjectId, setNewChatProjectId] = useState<string>();
   const [openingWorkspaceTarget, setOpeningWorkspaceTarget] = useState<OpenWorkspaceTarget>();
 
   const pendingLinkedSource = pendingLinkedSourceId ? runtimeState.sessions[pendingLinkedSourceId] : undefined;
   const composerDisabled = !isRuntimeAvailable || (selectedSession ? !canResume || isResuming : isCreating);
-  const canOpenSelectedWorkspace = Boolean(isRuntimeAvailable && selectedSession?.cwd.trim());
+  const canOpenSelectedWorkspace = Boolean(isRuntimeAvailable && selectedSession?.cwd.trim() && selectedSession.workspaceConnection?.kind !== 'ssh');
+  const localFallbackCwd =
+    latestSessionCwd(
+      sessions.filter((session) => session.workspaceConnection?.kind !== 'ssh'),
+      invalidProjectCwds,
+    ) ?? defaultWorkspaceCwd();
+  const chatComputers = useMemo(
+    () =>
+      chatComputerOptions({
+        projects: Object.values(runtimeState.chatProjects ?? {}),
+        sessions,
+        currentConnection: newWorkspaceConnection,
+        currentCwd: newCwd,
+        localCwd: localFallbackCwd,
+      }),
+    [runtimeState.chatProjects, sessions, newWorkspaceConnection, newCwd, localFallbackCwd],
+  );
+
+  const selectNewChatComputer = useCallback(
+    (computerId: string) => {
+      const target = chatComputers.find((computer) => computer.id === computerId);
+      if (!target || computerConnectionId(newWorkspaceConnection) === target.id) return;
+      const next = draftForComputer(
+        {
+          connection: newWorkspaceConnection,
+          cwd: newCwd,
+          projectId: newChatProjectId,
+          workMode: newWorkMode,
+          branch: newBranch,
+        },
+        target,
+      );
+      setNewChatProjectId(next.projectId);
+      setNewCwd(next.cwd);
+      setNewWorkspaceConnection(next.connection);
+      setNewWorkMode(next.workMode);
+      setNewBranch(next.branch);
+    },
+    [
+      chatComputers,
+      newWorkspaceConnection,
+      newCwd,
+      newChatProjectId,
+      newWorkMode,
+      newBranch,
+      setNewCwd,
+      setNewWorkspaceConnection,
+      setNewWorkMode,
+      setNewBranch,
+    ],
+  );
 
   const startNewChat = useCallback(() => {
+    setNewChatProjectId(undefined);
     setPendingLinkedSourceId(null);
     setSelectedSessionId(null);
-    setNewCwd(latestSessionCwd(sessions, invalidProjectCwds) ?? defaultWorkspaceCwd());
+    setNewCwd(localFallbackCwd);
+    setNewWorkspaceConnection({ kind: 'local' });
     setNewWorkMode('local');
     setNewBranch('');
     setActiveTab('chat');
     setShowRawEvents(false);
     clearComposer();
-  }, [clearComposer, invalidProjectCwds, sessions, setActiveTab, setNewBranch, setNewCwd, setNewWorkMode, setSelectedSessionId, setShowRawEvents]);
+  }, [
+    clearComposer,
+    localFallbackCwd,
+    setActiveTab,
+    setNewBranch,
+    setNewCwd,
+    setNewWorkspaceConnection,
+    setNewWorkMode,
+    setSelectedSessionId,
+    setShowRawEvents,
+  ]);
+
+  const startProjectChat = useCallback(
+    (projectId: string) => {
+      const project = runtimeState.chatProjects?.[projectId];
+      if (!project) return;
+      startNewChat();
+      setNewCwd(project.cwd);
+      setNewWorkspaceConnection(project.connection ?? { kind: 'local' });
+      setNewChatProjectId(projectId);
+    },
+    [runtimeState.chatProjects, setNewCwd, setNewWorkspaceConnection, startNewChat],
+  );
+
+  const clearNewChatProject = useCallback(() => {
+    setNewChatProjectId(undefined);
+  }, []);
+
+  const selectNewChatProject = useCallback(
+    (project: ChatProject) => {
+      setNewChatProjectId(project.projectId);
+      setNewCwd(project.cwd);
+      setNewWorkspaceConnection(project.connection ?? { kind: 'local' });
+      setNewWorkMode('local');
+      setNewBranch('');
+    },
+    [setNewCwd, setNewWorkspaceConnection, setNewWorkMode, setNewBranch],
+  );
+
+  const changeNewChatProjectCwd = useCallback(
+    (cwd: string) => {
+      setNewCwd(cwd);
+      const projectId = projectIdForSelectedCwd(runtimeState, newChatProjectId, cwd.trim(), pendingLinkedSourceId);
+      setNewChatProjectId(projectId);
+      if (projectId) setNewWorkspaceConnection(runtimeState.chatProjects?.[projectId]?.connection ?? { kind: 'local' });
+    },
+    [runtimeState, newChatProjectId, pendingLinkedSourceId, setNewCwd, setNewWorkspaceConnection],
+  );
 
   const startLinkedChat = useCallback(() => {
     if (!selectedSession) {
       return;
     }
 
-    const sourceCwd = invalidProjectCwds.has(selectedSession.cwd)
-      ? (latestSessionCwd(sessions, invalidProjectCwds) ?? defaultWorkspaceCwd())
-      : selectedSession.cwd;
+    const sourceCwd =
+      selectedSession.workspaceConnection?.kind !== 'ssh' && invalidProjectCwds.has(selectedSession.cwd) ? localFallbackCwd : selectedSession.cwd;
 
     setPendingLinkedSourceId(selectedSession.sessionId);
+    setNewChatProjectId(selectedSession.chatProjectId);
     setSelectedSessionId(null);
     changeNewProviderKind(selectedSession.providerKind);
     setNewCwd(sourceCwd);
+    setNewWorkspaceConnection(selectedSession.workspaceConnection ?? { kind: 'local' });
     setNewWorkMode('local');
     setNewBranch('');
     setActiveTab('chat');
@@ -122,11 +233,12 @@ export function useSessionActions({
     changeNewProviderKind,
     clearComposer,
     invalidProjectCwds,
+    localFallbackCwd,
     selectedSession,
-    sessions,
     setActiveTab,
     setNewBranch,
     setNewCwd,
+    setNewWorkspaceConnection,
     setNewWorkMode,
     setSelectedSessionId,
     setShowRawEvents,
@@ -175,8 +287,10 @@ export function useSessionActions({
           context: options.context,
           attachments: options.attachments,
           cwd,
-          workMode: newWorkMode,
-          ...(newWorkMode === 'worktree' && newBranch.trim().length > 0 ? { branch: newBranch.trim() } : {}),
+          workspaceConnection: newWorkspaceConnection,
+          chatProjectId: projectIdForDraft(runtimeState, newChatProjectId, cwd, sourceSessionId),
+          workMode: newWorkspaceConnection.kind === 'ssh' ? 'local' : newWorkMode,
+          ...(newWorkspaceConnection.kind !== 'ssh' && newWorkMode === 'worktree' && newBranch.trim().length > 0 ? { branch: newBranch.trim() } : {}),
           agent: selectedProvider.agent,
           providerKind: selectedProvider.id,
           providerInstanceId: newProviderInstance.providerInstanceId,
@@ -208,6 +322,8 @@ export function useSessionActions({
     [
       newBranch,
       newCwd,
+      newWorkspaceConnection,
+      newChatProjectId,
       newModel,
       newProviderInstance.providerInstanceId,
       newProviderKind,
@@ -215,7 +331,7 @@ export function useSessionActions({
       newRuntimeMode,
       newWorkMode,
       runtimeApi,
-      runtimeState.sessions,
+      runtimeState,
       runtimeUnavailableText,
       sessions.length,
       setActiveTab,
@@ -237,8 +353,16 @@ export function useSessionActions({
     }
     const goalCommand = parseGoalComposerCommand(trimmed);
     if (goalCommand) {
+      if ((selectedSession ? selectedSession.workspaceConnection : newWorkspaceConnection)?.kind === 'ssh') {
+        setRuntimeError('Thread goals are not available for SSH chats. Send a regular message to continue this chat.');
+        return;
+      }
       if (composerAttachments.length > 0) {
         setRuntimeError('Remove attachments before using /goal.');
+        return;
+      }
+      if (selectedSession && sessionRuntimeSettingsPatch) {
+        setRuntimeError('Send a regular message to apply changed chat settings before using /goal.');
         return;
       }
       if (goalCommand.kind === 'invalid') {
@@ -280,6 +404,7 @@ export function useSessionActions({
             objective: goalCommand.objective,
             status: 'active',
             cwd,
+            chatProjectId: projectIdForDraft(runtimeState, newChatProjectId, cwd, pendingLinkedSourceId),
             workMode: newWorkMode,
             ...(newWorkMode === 'worktree' && newBranch.trim().length > 0 ? { branch: newBranch.trim() } : {}),
             agent: selectedProvider.agent,
@@ -291,9 +416,7 @@ export function useSessionActions({
               reasoningEffort: newReasoningEffort,
             }),
             label: `New Chat ${sessions.length + 1}`,
-            ...(pendingLinkedSourceId
-              ? { sourceSessionId: pendingLinkedSourceId, linkLabel: 'created from chat' }
-              : {}),
+            ...(pendingLinkedSourceId ? { sourceSessionId: pendingLinkedSourceId, linkLabel: 'created from chat' } : {}),
           });
           setRuntimeState(result.state);
           if (result.sessionId) setSelectedSessionId(result.sessionId);
@@ -311,14 +434,15 @@ export function useSessionActions({
       setIsResuming(true);
       setRuntimeError(undefined);
       try {
-        const result = goalCommand.kind === 'clear'
-          ? await runtimeApi.clearThreadGoal({ sessionId: selectedSessionId })
-          : await runtimeApi.setThreadGoal({
-              sessionId: selectedSessionId,
-              ...(goalCommand.kind === 'set'
-                ? { objective: goalCommand.objective, status: 'active' as const }
-                : { status: goalCommand.kind === 'pause' ? 'paused' as const : 'active' as const }),
-            });
+        const result =
+          goalCommand.kind === 'clear'
+            ? await runtimeApi.clearThreadGoal({ sessionId: selectedSessionId })
+            : await runtimeApi.setThreadGoal({
+                sessionId: selectedSessionId,
+                ...(goalCommand.kind === 'set'
+                  ? { objective: goalCommand.objective, status: 'active' as const }
+                  : { status: goalCommand.kind === 'pause' ? ('paused' as const) : ('active' as const) }),
+              });
         setRuntimeState(result.state);
         clearComposer();
       } catch (error) {
@@ -328,7 +452,7 @@ export function useSessionActions({
       }
       return;
     }
-    const prompt = trimmed.length > 0 ? trimmed : 'Please review the attached files.';
+    const prompt = trimmed.length > 0 ? trimmed : 'Please review the attached context.';
 
     if (!selectedSession || !selectedSessionId) {
       const created = await createSessionFromPrompt(prompt, {
@@ -349,8 +473,10 @@ export function useSessionActions({
         sessionId: selectedSessionId,
         message: prompt,
         attachments: composerAttachments,
+        ...(sessionRuntimeSettingsPatch ? { runtimeSettings: sessionRuntimeSettingsPatch } : {}),
       });
       setRuntimeState(result.state);
+      clearSessionSettings(selectedSessionId);
       clearComposer();
     } catch (error) {
       setRuntimeError(error instanceof Error ? error.message : String(error));
@@ -360,10 +486,14 @@ export function useSessionActions({
   }, [
     clearComposer,
     composerAttachments,
+    sessionRuntimeSettingsPatch,
+    clearSessionSettings,
     createSessionFromPrompt,
     message,
     newBranch,
     newCwd,
+    newWorkspaceConnection,
+    newChatProjectId,
     newModel,
     newProviderInstance.providerInstanceId,
     newProviderKind,
@@ -372,6 +502,7 @@ export function useSessionActions({
     newWorkMode,
     pendingLinkedSourceId,
     runtimeApi,
+    runtimeState,
     runtimeUnavailableText,
     selectedSession,
     selectedSessionId,
@@ -382,24 +513,28 @@ export function useSessionActions({
     sessions.length,
   ]);
 
-  const controlSelectedThreadGoal = useCallback(async (command: Extract<GoalComposerCommand, { kind: 'pause' | 'resume' | 'clear' }>) => {
-    if (!runtimeApi || !selectedSessionId) return;
-    setIsResuming(true);
-    setRuntimeError(undefined);
-    try {
-      const result = command.kind === 'clear'
-        ? await runtimeApi.clearThreadGoal({ sessionId: selectedSessionId })
-        : await runtimeApi.setThreadGoal({
-            sessionId: selectedSessionId,
-            status: command.kind === 'pause' ? 'paused' : 'active',
-          });
-      setRuntimeState(result.state);
-    } catch (error) {
-      setRuntimeError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setIsResuming(false);
-    }
-  }, [runtimeApi, selectedSessionId, setRuntimeError, setRuntimeState]);
+  const controlSelectedThreadGoal = useCallback(
+    async (command: Extract<GoalComposerCommand, { kind: 'pause' | 'resume' | 'clear' }>) => {
+      if (!runtimeApi || !selectedSessionId) return;
+      setIsResuming(true);
+      setRuntimeError(undefined);
+      try {
+        const result =
+          command.kind === 'clear'
+            ? await runtimeApi.clearThreadGoal({ sessionId: selectedSessionId })
+            : await runtimeApi.setThreadGoal({
+                sessionId: selectedSessionId,
+                status: command.kind === 'pause' ? 'paused' : 'active',
+              });
+        setRuntimeState(result.state);
+      } catch (error) {
+        setRuntimeError(error instanceof Error ? error.message : String(error));
+      } finally {
+        setIsResuming(false);
+      }
+    },
+    [runtimeApi, selectedSessionId, setRuntimeError, setRuntimeState],
+  );
 
   const killSelectedSession = useCallback(async () => {
     if (!runtimeApi || !selectedSessionId) {
@@ -470,6 +605,8 @@ export function useSessionActions({
       try {
         await runtimeApi.openWorkspace({
           cwd: selectedSession.cwd,
+          sessionId: selectedSession.sessionId,
+          workspaceConnection: selectedSession.workspaceConnection ?? { kind: 'local' },
           target,
         });
       } catch (error) {
@@ -526,10 +663,17 @@ export function useSessionActions({
     pendingLinkedSourceId,
     setPendingLinkedSourceId,
     pendingLinkedSource,
+    newChatProjectId,
+    chatComputers,
+    selectNewChatComputer,
+    clearNewChatProject,
+    selectNewChatProject,
+    changeNewChatProjectCwd,
     openingWorkspaceTarget,
     composerDisabled,
     canOpenSelectedWorkspace,
     startNewChat,
+    startProjectChat,
     startLinkedChat,
     createSessionFromPrompt,
     sendChatMessage,
