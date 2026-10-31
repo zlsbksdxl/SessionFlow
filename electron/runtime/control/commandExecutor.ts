@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto'
 import { validateExecutionEnvelope } from '../../../shared/execution-envelope.js'
 import type { KernelActor } from '../../../shared/graph-core/index.js'
 import { ContextChannelStore } from '../contextChannel.js'
+import type { RuntimeRunContext } from '../sessions/runtimeRunContext.js'
 import {
   ControlVersionConflictError,
   KernelStore,
@@ -42,7 +43,7 @@ export type CommandExecutorHost = {
   setState: (state: JsonRecord) => void
   getPublicState: () => JsonRecord
   getRuns: () => Map<string, RunHandle>
-  getRunContext: () => Map<string, JsonRecord>
+  getRunContext: () => Map<string, RuntimeRunContext>
   getWorkflowCompensatedRuns: () => Set<string>
   automaticDeploymentExistingSessionIds: (
     kind: string,
@@ -56,7 +57,7 @@ export type CommandExecutorHost = {
     actor: KernelActor,
     lifecycleEpochs: AutonomousLifecycleEpochs | undefined,
   ) => void
-  onControlKernelEvent: (event: JsonRecord) => void
+  onControlKernelEvent: (event: JsonRecord, authorizedLifecycleEpoch?: number) => void
   onEffectKernelEvent: (event: JsonRecord) => void
   drainWorkflowWakeups: () => void
   drainApprovedSlots: () => Promise<unknown>
@@ -128,14 +129,14 @@ export class CommandExecutor {
       : (this.#committedStateDuringCommand ?? this.#host.getState())
   }
 
-  async dispatch(command: JsonRecord = {}): Promise<any> {
+  async dispatch(command: JsonRecord = {}, options: { reviveAutonomousDrains?: boolean } = {}): Promise<any> {
     const actorKind = command?.actor?.kind
     // Preserve the manager's reusable-runtime contract for every command
     // plane (human, master, agent, and rule). The captured lifecycle epoch
     // still prevents work submitted before killAll from reviving controllers
     // after that shutdown boundary.
     const lifecycleEpochs =
-      actorKind && actorKind !== 'runtime'
+      options.reviveAutonomousDrains !== false && actorKind && actorKind !== 'runtime'
         ? this.#host.reviveAutonomousDrains()
         : undefined
     this.#pendingCommandCount += 1
@@ -324,7 +325,7 @@ export class CommandExecutor {
       this.#host.getState().controlVersion =
         committed.record.committedVersion
       this.#committedStateDuringCommand = undefined
-      this.#publishCommittedEvents(committed.events)
+      this.#publishCommittedEvents(committed.events, lifecycleEpochs?.runQueue)
       this.#runPostCommitEffects(transaction.postCommitEffects)
       this.#publishDeferredBroadcasts(transaction.broadcasts)
       if (
@@ -391,7 +392,7 @@ export class CommandExecutor {
         this.#host.getState().controlVersion =
           committed.record.committedVersion
         this.#committedStateDuringCommand = undefined
-        this.#publishCommittedEvents(committed.events)
+        this.#publishCommittedEvents(committed.events, lifecycleEpochs?.runQueue)
         this.#runPostCommitEffects(transaction.postCommitEffects)
         this.#publishDeferredBroadcasts(transaction.broadcasts)
         this.#runAuthorizedCommandCommitEffect(ctx.actor, lifecycleEpochs)
@@ -628,10 +629,10 @@ export class CommandExecutor {
     }
   }
 
-  #publishCommittedEvents(events: JsonRecord[]) {
+  #publishCommittedEvents(events: JsonRecord[], authorizedLifecycleEpoch?: number) {
     for (const event of events) {
       this.#emit({ type: 'kernel.event', event })
-      this.#host.onControlKernelEvent(event)
+      this.#host.onControlKernelEvent(event, authorizedLifecycleEpoch)
     }
   }
 

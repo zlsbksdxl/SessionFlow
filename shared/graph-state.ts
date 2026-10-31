@@ -1,56 +1,27 @@
+import * as graphVocabulary from './graph-enums.js'
 import { defaultProviderInstances } from './provider-metadata.js'
 
-export const graphStateVersion = 8
+export const graphStateVersion = graphVocabulary.graphStateVersion
 
 // Intent-layer enums (kernel doc §7.3). Kept as value arrays so the electron
 // build and the renderer share one vocabulary.
-export const subscriptionGates = ['auto', 'master', 'human']
-export const subscriptionConcurrencies = ['coalesce', 'queue', 'drop', 'interrupt']
-export const subscriptionOnStops = ['freeze-edge', 'freeze-target', 'freeze-cluster']
-export const subscriptionStates = ['active', 'stopped']
-export const subscriptionPatterns = ['finished', 'failed', 'report', 'delivered', 'schedule', 'external']
+export const subscriptionGates: readonly string[] = graphVocabulary.subscriptionGates
+export const subscriptionConcurrencies: readonly string[] = graphVocabulary.subscriptionConcurrencies
+export const subscriptionOnStops: readonly string[] = graphVocabulary.subscriptionOnStops
+export const subscriptionStates: readonly string[] = graphVocabulary.subscriptionStates
+export const subscriptionPatterns: readonly string[] = graphVocabulary.subscriptionPatterns
 
-export const sessionStatuses = [
-  'pending',
-  'running',
-  'idle',
-  'failed',
-  'killed',
-]
+export const sessionStatuses: readonly string[] = graphVocabulary.sessionStatuses
 
-export const reportTypes = ['verdict', 'relationship', 'info']
+export const reportTypes: readonly string[] = graphVocabulary.reportTypes
 
-export const graphEdgeKinds = [
-  'create-session',
-  'resume-session',
-  'report',
-  'freeze',
-  'link',
-]
+export const graphEdgeKinds: readonly string[] = graphVocabulary.graphEdgeKinds
 
-export const openWorkspaceTargetIds = [
-  'vscode',
-  'cursor',
-  'windsurf',
-  'antigravity',
-  'finder',
-  'terminal',
-  'ghostty',
-  'xcode',
-]
+export const openWorkspaceTargetIds: readonly string[] = graphVocabulary.openWorkspaceTargetIds
 
-export const runtimeTerminalStatuses = [
-  'running',
-  'exited',
-  'closed',
-]
+export const runtimeTerminalStatuses: readonly string[] = graphVocabulary.runtimeTerminalStatuses
 
-export const runtimeTerminalStreams = [
-  'stdin',
-  'stdout',
-  'stderr',
-  'system',
-]
+export const runtimeTerminalStreams: readonly string[] = graphVocabulary.runtimeTerminalStreams
 
 export const defaultGraphProviderInstances = defaultProviderInstances
 

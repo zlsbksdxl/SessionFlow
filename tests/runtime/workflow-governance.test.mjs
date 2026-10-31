@@ -2,10 +2,12 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import net from 'node:net'
 import test from 'node:test'
 
 import { RuntimeSessionManager as BaseRuntimeSessionManager } from '../../dist-electron/electron/runtime/sessionManager.js'
 import { KernelStore, kernelDatabaseFileFor } from '../../dist-electron/electron/runtime/kernelStore.js'
+import { MembraneBridge } from '../../dist-electron/electron/runtime/membraneBridge.js'
 import {
   deterministicProviderAdapters,
   deterministicRuntimeSessionManager,
@@ -13,6 +15,39 @@ import {
 
 const RuntimeSessionManager = deterministicRuntimeSessionManager(BaseRuntimeSessionManager)
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+function bridgeShutdownWatch() {
+  const start = MembraneBridge.prototype.start
+  const urls = new Set()
+  const lateStarts = []
+  let stopping = false
+  MembraneBridge.prototype.start = function (...args) {
+    if (stopping) lateStarts.push(new Error('Bridge restarted after shutdown').stack)
+    const result = Reflect.apply(start, this, args)
+    void result.then((url) => urls.add(url), () => {})
+    return result
+  }
+  return {
+    stop: () => { stopping = true },
+    restore: () => { MembraneBridge.prototype.start = start },
+    async verify() {
+      // Let the old review/triage continuations and their queued scheduler
+      // commands run. They must remain fenced even with no ambient command.
+      await delay(1200)
+      assert.deepEqual(lateStarts, [], 'old automation must not restart a closed membrane bridge')
+      for (const url of urls) {
+        const parsed = new URL(url)
+        const closed = await new Promise((resolve, reject) => {
+          const socket = net.createConnection({ host: parsed.hostname, port: Number(parsed.port) })
+          socket.on('connect', () => { socket.destroy(); resolve(false) })
+          socket.on('error', (error) => error.code === 'ECONNREFUSED' ? resolve(true) : reject(error))
+          socket.setTimeout(1000, () => { socket.destroy(); reject(new Error('Bridge port probe timed out')) })
+        })
+        assert.equal(closed, true, `${url} must stop accepting real TCP connections after killAll`)
+      }
+    },
+  }
+}
 
 async function waitFor(label, predicate, timeoutMs = 12000) {
   const started = Date.now()
@@ -224,6 +259,7 @@ async function activeReview(runtime) {
 test('Master can propose and commit a bounded dynamic triage relationship', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orrery-governor-dynamic-triage-'))
   const runtime = new RuntimeSessionManager({ storageFile: path.join(root, 'state.json') })
+  const bridge = bridgeShutdownWatch()
   try {
     const fixture = await activeReview(runtime)
     const proposed = await runtime.dispatchCommand({
@@ -283,8 +319,15 @@ test('Master can propose and commit a bounded dynamic triage relationship', asyn
     assert.equal(group.execution.workflowVersion, 2)
     assert.equal(group.execution.phaseId, 'review-issue-triage')
   } finally {
-    runtime.killAll()
-    fs.rmSync(root, { recursive: true, force: true })
+    try {
+      bridge.stop()
+      await runtime.killAll()
+      await bridge.verify()
+    } finally {
+      bridge.restore()
+      await runtime.killAll()
+      fs.rmSync(root, { recursive: true, force: true })
+    }
   }
 })
 

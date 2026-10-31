@@ -16,6 +16,7 @@ import { CollaborationRuntime, type CollaborationContext } from './collaboration
 //      - resource policy, run queue, launchRun, provider event stream
 //      - checkpoints/diffs, reports, persistence triggers
 import { randomUUID } from 'node:crypto'
+import type { RuntimeRunContext } from './sessions/runtimeRunContext.js'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -144,7 +145,7 @@ export class RuntimeSessionManager {
   #updatePrepareInFlight?: Promise<void>
   #updateResumeRequested = false
   #directProviderOperations = 0
-  #runContext = new Map<string, JsonRecord>()
+  #runContext = new Map<string, RuntimeRunContext>()
   #terminalService = new TerminalService({
     broadcast: (event) => this.#broadcast(event),
     resolveSession: (sessionId) => this.#state.sessions[sessionId],
@@ -236,7 +237,9 @@ export class RuntimeSessionManager {
     channelStore: () => this.#channelStore,
     queries: () => this.#queries,
     checkpointHost: () => this.#checkpointHost(),
-    dispatchCommand: (command) => this.dispatchCommand(command),
+    dispatchCommand: (command, options) => options?.reviveAutonomousDrains === false
+      ? this.#commandExecutor.dispatch(command, options)
+      : this.dispatchCommand(command),
     appendKernelEvent: (type, payload, ctx, options) => this.#appendKernelEvent(type, payload, ctx, options),
     touch: () => this.#touch(),
     touchDeferred: () => this.#touchDeferred(),
@@ -249,6 +252,12 @@ export class RuntimeSessionManager {
     planCouncilFinished: (sessionId, runId, eventId) => planCouncilFinished(this.#wf(), sessionId, runId, eventId),
     planCouncilFailed: (sessionId, error) => planCouncilFailed(this.#wf(), sessionId, error),
     journalAutomaticDeploymentRunStarted: (sessionId) => journalAutomaticDeploymentRunStarted(this.#wf(), sessionId),
+    controlTransactionActive: () => Boolean(this.#commandExecutor.currentTransaction()),
+    deferProviderLaunchUntilCommit: () => {
+      const kind = this.#commandExecutor.currentTransaction()?.kind
+      return kind === 'create_session' || kind === 'resume_session' || kind === 'activate'
+    },
+    stagePostCommitEffect: (effect) => this.#commandExecutor.stagePostCommitEffect(effect),
     commandLifecycleEpoch: () => {
       const transaction = this.#commandExecutor.currentTransaction()
       return transaction?.actor.kind !== 'runtime'
@@ -302,6 +311,11 @@ export class RuntimeSessionManager {
     startPlanCouncil: (input) => this.startPlanCouncil(input),
   })
   #scheduler = new SchedulerRuntime({
+    lifecycle: () => ({
+      epoch: this.#sessionRuntime.lifecycleEpoch(),
+      enabled: this.#sessionRuntime.isQueueDrainEnabled(),
+      authorizedCommandEpoch: this.#commandExecutor.currentTransaction()?.lifecycleEpochs?.runQueue,
+    }),
     state: () => this.#state,
     runs: () => this.#runs,
     queries: () => this.#queries,
@@ -660,14 +674,18 @@ export class RuntimeSessionManager {
             lifecycleEpochs !== undefined &&
             actor.kind !== 'runtime'
           ) {
-            this.#sessionRuntime.resumeQueueDrain(lifecycleEpochs.runQueue)
+            const wasEnabled = this.#sessionRuntime.isQueueDrainEnabled()
+            const resumed = this.#sessionRuntime.resumeQueueDrain(lifecycleEpochs.runQueue)
+            if (resumed && !wasEnabled) {
+              queueMicrotask(() => { void this.#scheduler.drainApprovedSlots() })
+            }
             this.#externalIngestion.resumeAdapters(
               lifecycleEpochs.externalAdapters,
             )
           }
         },
-        onControlKernelEvent: (event) => {
-          this.#scheduler.enqueueSchedulerEvent(event)
+        onControlKernelEvent: (event, authorizedLifecycleEpoch) => {
+          this.#scheduler.enqueueSchedulerEvent(event, authorizedLifecycleEpoch)
           if (this.#providerService) this.#collaboration.onKernelEvent(event)
           this.#governance.queueWorkflowWakeupsForKernelEvent(event)
         },
@@ -1133,8 +1151,10 @@ export class RuntimeSessionManager {
     this.#governance.suspendWakeupDrain()
     this.#sessionRuntime.suspendQueueDrain()
     this.#persistState()
-    for (const sessionId of this.#runs.keys()) {
-      this.killSession(sessionId)
+    for (const [sessionId, run] of this.#runs) {
+      // Pending launches observe the shutdown signal above; they have no
+      // provider process to kill and retain the existing failed-launch fact.
+      if (!run.pendingLaunch) this.killSession(sessionId)
     }
     for (const terminalId of this.#terminalService.runningTerminalIds()) {
       this.closeTerminal({ terminalId })
@@ -1153,7 +1173,12 @@ export class RuntimeSessionManager {
     // silently drop later kernel events. If a newer runtime takes over the
     // same store, this connection's snapshot writes are dropped by the
     // snapshot-owner check instead of clobbering the newer state.
-    return providerShutdown
+    return Promise.resolve(providerShutdown)
+      .then(() => this.#sessionRuntime.flushWorkspaceOperations())
+      // Async checkpoint completion can append canonical events after the
+      // provider's first closeAll flush. Include them in the quit boundary.
+      .then(() => this.#providerService.flushLogs())
+      .then(() => { this.#persistState() })
   }
 
   #trackDirectProviderOperation<T>(run: () => Promise<T>): Promise<T> {
@@ -1168,6 +1193,7 @@ export class RuntimeSessionManager {
     if (this.#commandExecutor.pendingCommandCount() || this.#directProviderOperations) blockers.push('A runtime operation is still in progress')
     if (this.#updatePrepareInFlight) blockers.push('An update save is still finishing')
     if (this.#runs.size) blockers.push('A provider process is still active')
+    if (this.#sessionRuntime.hasPendingWorkspaceOperations()) blockers.push('A workspace checkpoint is still finishing')
     if (this.#terminalService.runningTerminalIds().length) blockers.push('An embedded terminal is still open')
     if (this.#planCouncilInFlight.size || this.#goalLoopInFlight.size || this.#classicWorkflowInFlight.size) blockers.push('A workflow is being configured')
     if (Object.values(this.#state.sources ?? {}).some((source: JsonRecord) => source.state === 'active' && source.kind === 'script')) blockers.push('A script event source is still running')

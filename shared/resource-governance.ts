@@ -30,7 +30,7 @@ export type QueuedProviderRun = {
   priority: number
   order: number
   queuedAt: string
-  reason: 'provider-cap' | 'scope-cap' | 'workspace-lease'
+  reason: 'provider-cap' | 'scope-cap' | 'workspace-lease' | 'command-commit'
   request: Record<string, unknown>
   execution?: ExecutionEnvelope
   reservedTokens?: number

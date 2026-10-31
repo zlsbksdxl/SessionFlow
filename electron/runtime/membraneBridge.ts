@@ -47,39 +47,79 @@ function bearerToken(request) {
 }
 
 export class MembraneBridge {
-  #server
+  #server: http.Server | undefined
   #tokens = new Map()
   #handler
-  #url
+  #url: string | undefined
+  #starting: Promise<string> | undefined
+  #cancelStart: (() => void) | undefined
+  #generation = 0
 
   constructor({ handler }) {
     this.#handler = handler
   }
 
-  async start() {
+  start(): Promise<string> {
+    if (this.#starting) return this.#starting
     if (this.#url) {
-      return this.#url
+      return Promise.resolve(this.#url)
     }
 
-    this.#server = http.createServer((request, response) => {
+    const generation = this.#generation
+    const server = http.createServer((request, response) => {
       void this.#handleRequest(request, response)
     })
-
-    await new Promise<void>((resolve, reject) => {
-      this.#server.once('error', reject)
-      this.#server.listen(0, '127.0.0.1', () => {
-        this.#server.off('error', reject)
-        resolve()
-      })
-    })
-
-    const address = this.#server.address()
-    if (!address || typeof address === 'string') {
-      throw new Error('Failed to bind Orrery membrane bridge')
+    let resolve!: (url: string) => void
+    let reject!: (error: Error) => void
+    const starting = new Promise<string>((yes, no) => { resolve = yes; reject = no })
+    let settled = false
+    const release = () => {
+      if (this.#starting !== starting) return
+      this.#starting = undefined
+      this.#cancelStart = undefined
     }
-
-    this.#url = `http://127.0.0.1:${address.port}`
-    return this.#url
+    const fail = (error: Error) => {
+      if (settled) return
+      settled = true
+      if (this.#server === server) this.#server = undefined
+      release()
+      reject(error)
+    }
+    const onError = (error: Error) => {
+      server.off('listening', onListening)
+      fail(error)
+    }
+    const onListening = () => {
+      server.off('error', onError)
+      // A close/revive may have replaced this generation while listen was
+      // pending. Close the captured server, never the newer live binding.
+      if (generation !== this.#generation || this.#server !== server) {
+        server.close()
+        fail(new Error('Orrery membrane bridge was closed while starting.'))
+        return
+      }
+      const address = server.address()
+      if (!address || typeof address === 'string') {
+        server.close()
+        fail(new Error('Failed to bind Orrery membrane bridge'))
+        return
+      }
+      settled = true
+      this.#url = `http://127.0.0.1:${address.port}`
+      release()
+      resolve(this.#url)
+    }
+    this.#server = server
+    this.#starting = starting
+    this.#cancelStart = () => fail(new Error('Orrery membrane bridge was closed while starting.'))
+    server.once('error', onError)
+    server.once('listening', onListening)
+    // Own the rejection cleanup even if a caller races startup against an
+    // independent shutdown signal and no longer awaits this promise.
+    void starting.then(release, release)
+    try { server.listen(0, '127.0.0.1') }
+    catch (error) { onError(error instanceof Error ? error : new Error(String(error))) }
+    return starting
   }
 
   createRunToken(sourceSessionId) {
@@ -94,9 +134,17 @@ export class MembraneBridge {
 
   close() {
     this.#tokens.clear()
-    this.#server?.close()
+    this.#generation += 1
+    const server = this.#server
+    const cancelStart = this.#cancelStart
     this.#server = undefined
     this.#url = undefined
+    this.#starting = undefined
+    this.#cancelStart = undefined
+    cancelStart?.()
+    // A not-yet-listening server is closed by onListening when its old
+    // generation eventually binds; calling close early can miss that bind.
+    if (server?.listening) server.close()
   }
 
   async #handleRequest(request, response) {

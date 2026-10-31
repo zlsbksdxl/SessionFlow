@@ -141,8 +141,18 @@ export async function run({ orrery, provider, workDir, log }) {
   const ring = (state.loops ?? []).find((candidate) => candidate.loopId === started.loop.loopId);
   assert.equal(ring?.status, 'stopped');
   assert.ok(ring.lapCount <= 4);
-  const reviewerAssistantTurns = state.sessions[reviewerId].messages.filter((message) => message.role === 'assistant');
-  assert.equal(reviewerAssistantTurns.length, 2, 'Reviewer ran only issues and clean turns');
+  // A provider turn may contain both commentary and a final answer. Count
+  // actual completed runs so those messages do not look like extra reviews.
+  const reviewerCompletedTurns = new Set(
+    state.sessions[reviewerId].runtimeEvents
+      .filter((event) => event.type === 'turn.completed')
+      .map((event) => event.turnId),
+  );
+  assert.equal(reviewerCompletedTurns.size, 2, 'Reviewer ran only issues and clean turns');
+  assert.deepEqual(
+    state.reports.filter((report) => report.from === reviewerId && report.payload?.type === 'verdict').map((report) => report.payload.verdict),
+    ['issues', 'clean'],
+  );
 
   const { events } = await orrery.kernelEvents({ limit: 5000 });
   const authoredSeqs = events

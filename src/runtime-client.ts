@@ -1,180 +1,16 @@
 import { useEffect, useMemo, useState } from 'react';
+import { runtimeHttpRequest, type RuntimeOperationName, type RuntimeOperationInput, type RuntimeOperationResult } from '@shared/runtime-operations';
 
-import type {
-  AnswerUserInputInput,
-  ArchiveRuntimeSessionInput,
-  AssignMasterToClusterInput,
-  ClearTerminalInput,
-  CloseTerminalInput,
-  CreateTerminalInput,
-  CreateMasterForClusterInput,
-  CreateRuntimeSessionInput,
-  CreateRuntimeSessionResult,
-  ForkRuntimeSessionInput,
-  ForkRuntimeSessionResult,
-  FreezeInput,
-  UnfreezeInput,
-  GetTerminalInput,
-  CreateGoalLoopInput,
-  CreateGoalLoopResult,
-  EmitExternalEventInput,
-  EmitExternalEventResult,
-  GraphState,
-  KernelEvent,
-  LoopTimelineResult,
-  OpenWorkspaceInput,
-  OpenWorkspaceResult,
-  ProviderSetupStatus,
-  ProviderSetupStatusInput,
-  ProjectContext,
-  ProjectContextInput,
-  ApplyTemplateInput,
-  ApplyTemplateResult,
-  ListTemplatesResult,
-  RegisterExternalSourceInput,
-  RegisterExternalSourceResult,
-  SaveTemplateInput,
-  SaveTemplateResult,
-  RespondRuntimeRequestInput,
-  ResumeRuntimeSessionInput,
-  SetThreadGoalInput,
-  ClearThreadGoalInput,
-  RuntimeEvent,
-  RuntimeTerminalResult,
-  RunTerminalCommandInput,
-  RunTerminalCommandResult,
-  SessionId,
-  SetClusterLoopPolicyInput,
-  StartMasterLoopInput,
-  StartReviewWorkflowInput,
-  StartReviewWorkflowResult,
-  StartPlanCouncilInput,
-  StartPlanCouncilResult,
-  StartDraftWorkflowInput,
-  StartDraftWorkflowResult,
-  StartHandoffWorkflowInput,
-  StartHandoffWorkflowResult,
-  StartGoalWorkflowInput,
-  StartGoalWorkflowResult,
-  ConnectAgentsInput,
-  ConnectAgentsResult,
-  StopMasterLoopInput,
-  StopLoopInput,
-  UpdateNodePositionsInput,
-  UpsertProviderInstanceInput,
-  UpsertClusterInput,
-  WorkspaceFileContentInput,
-  WorkspaceFileContentResult,
-  WorkspaceFilesInput,
-  WorkspaceFilesResult,
-  WriteTerminalInput,
-  WorkingTreeDiffInput,
-  WorkingTreeDiffResult,
-} from '@/shared/graph-state';
-import type { PlanCouncil } from '@shared/plan-council';
-import type { ProviderInstance } from '@/shared/provider-runtime';
-import type { AppUpdateState, AppUpdateReadiness } from '@shared/app-update';
-import type {
-  ImportNativeSessionInput,
-  ImportNativeSessionResult,
-  ListNativeSessionsInput,
-  ListNativeSessionsResult,
-  NativeSessionDetails,
-  ReadNativeSessionInput,
-} from '@shared/native-session';
+import type { AnswerUserInputInput, ArchiveRuntimeSessionInput, AssignMasterToClusterInput, ClearTerminalInput, CloseTerminalInput, CreateTerminalInput, CreateMasterForClusterInput, CreateRuntimeSessionInput, ForkRuntimeSessionInput, FreezeInput, UnfreezeInput, GetTerminalInput, CreateGoalLoopInput, EmitExternalEventInput, GraphState, OpenWorkspaceInput, ProviderSetupStatusInput, ProjectContextInput, ApplyTemplateInput, RegisterExternalSourceInput, SaveTemplateInput, RespondRuntimeRequestInput, ResumeRuntimeSessionInput, SetThreadGoalInput, ClearThreadGoalInput, RuntimeEvent, RunTerminalCommandInput, SessionId, SetClusterLoopPolicyInput, StartMasterLoopInput, StartReviewWorkflowInput, StartPlanCouncilInput, StartDraftWorkflowInput, StartHandoffWorkflowInput, StartGoalWorkflowInput, ConnectAgentsInput, StopMasterLoopInput, StopLoopInput, UpdateNodePositionsInput, UpsertProviderInstanceInput, UpsertClusterInput, WorkspaceFileContentInput, WorkspaceFilesInput, WriteTerminalInput, WorkingTreeDiffInput } from '@/shared/graph-state';
+
+
+
+import type { ImportNativeSessionInput, ListNativeSessionsInput, ReadNativeSessionInput } from '@shared/native-session';
 
 const defaultRuntimeUrl = 'http://127.0.0.1:48274';
 
-export type RuntimeWorkspaceMetadata = {
-  defaultCwd?: string;
-};
-
-export type RuntimeConfig = {
-  platform?: string;
-  workspace?: RuntimeWorkspaceMetadata;
-};
-
-export type KernelEventsInput = { since?: number; limit?: number; tail?: boolean };
-export type KernelEventsResult = { events: KernelEvent[]; latestSeq: number };
-
-export type RuntimeApi = {
-  getState: () => Promise<GraphState>;
-  getKernelEvents: (input?: KernelEventsInput) => Promise<KernelEventsResult>;
-  dispatchCommand: (input: { commandId?: string; idempotencyKey?: string; expectedVersion?: number; kind: string; reason?: string; input?: Record<string, unknown> }) => Promise<Record<string, unknown>>;
-  getLoopTimeline: (input: { loopId: string }) => Promise<LoopTimelineResult>;
-  createGoalLoop: (input: CreateGoalLoopInput) => Promise<CreateGoalLoopResult>;
-  startReviewWorkflow: (input: StartReviewWorkflowInput) => Promise<StartReviewWorkflowResult>;
-  startPlanCouncil: (input: StartPlanCouncilInput) => Promise<StartPlanCouncilResult>;
-  getPlanCouncil: (input: { workflowId: string }) => Promise<{ council: PlanCouncil }>;
-  getPlanCouncilArtifact: (input: { workflowId: string; artifactId: string }) => Promise<{ artifact: PlanCouncil['artifacts'][number]; content: string }>;
-  startPlanCouncilCrossReview: (input: { workflowId: string }) => Promise<{ council: PlanCouncil; state: GraphState }>;
-  startPlanCouncilSynthesis: (input: { workflowId: string }) => Promise<{ council: PlanCouncil; state: GraphState }>;
-  stopPlanCouncil: (input: { workflowId: string; reason?: string }) => Promise<{ council: PlanCouncil; state: GraphState }>;
-  startDraftWorkflow: (input: StartDraftWorkflowInput) => Promise<StartDraftWorkflowResult>;
-  startHandoffWorkflow: (input: StartHandoffWorkflowInput) => Promise<StartHandoffWorkflowResult>;
-  startGoalWorkflow: (input: StartGoalWorkflowInput) => Promise<StartGoalWorkflowResult>;
-  connectAgents: (input: ConnectAgentsInput) => Promise<ConnectAgentsResult>;
-  registerExternalSource: (input: RegisterExternalSourceInput) => Promise<RegisterExternalSourceResult>;
-  removeExternalSource: (input: { sourceId: string; reason?: string }) => Promise<{ ok: boolean }>;
-  emitExternalEvent: (input: EmitExternalEventInput) => Promise<EmitExternalEventResult>;
-  listTemplates: () => Promise<ListTemplatesResult>;
-  applyTemplate: (input: ApplyTemplateInput) => Promise<ApplyTemplateResult>;
-  saveTemplate: (input: SaveTemplateInput) => Promise<SaveTemplateResult>;
-  removeTemplate: (input: { templateId: string }) => Promise<{ ok: boolean; state: GraphState }>;
-  getProjectContext: (input: ProjectContextInput) => Promise<ProjectContext>;
-  getProviderSetupStatus: (input: ProviderSetupStatusInput) => Promise<ProviderSetupStatus>;
-  upsertProviderInstance: (input: UpsertProviderInstanceInput) => Promise<{ providerInstance: ProviderInstance; state: GraphState }>;
-  chooseProjectFolder: () => Promise<{ canceled: boolean; cwd?: string }>;
-  listNativeSessions: (input: ListNativeSessionsInput) => Promise<ListNativeSessionsResult>;
-  readNativeSession: (input: ReadNativeSessionInput) => Promise<NativeSessionDetails>;
-  importNativeSession: (input: ImportNativeSessionInput) => Promise<ImportNativeSessionResult<GraphState>>;
-  createSession: (input: CreateRuntimeSessionInput) => Promise<CreateRuntimeSessionResult>;
-  forkSession: (input: ForkRuntimeSessionInput) => Promise<ForkRuntimeSessionResult>;
-  resumeSession: (input: ResumeRuntimeSessionInput) => Promise<{ ok: boolean; state: GraphState }>;
-  setThreadGoal: (input: SetThreadGoalInput) => Promise<{ ok?: boolean; sessionId?: SessionId; state: GraphState }>;
-  clearThreadGoal: (input: ClearThreadGoalInput) => Promise<{ ok: boolean; state: GraphState }>;
-  archiveSession: (input: ArchiveRuntimeSessionInput) => Promise<{ ok: boolean; state: GraphState }>;
-  killSession: (sessionId: SessionId) => Promise<{ ok: boolean; state: GraphState }>;
-  respondRuntimeRequest: (input: RespondRuntimeRequestInput) => Promise<{ ok: boolean; state: GraphState }>;
-  answerUserInput: (input: AnswerUserInputInput) => Promise<{ ok: boolean; state: GraphState }>;
-  upsertCluster: (input: UpsertClusterInput) => Promise<{ clusterId: string; state: GraphState }>;
-  createMasterForCluster: (input: CreateMasterForClusterInput) => Promise<{ sessionId: SessionId; state: GraphState }>;
-  assignMasterToCluster: (input: AssignMasterToClusterInput) => Promise<{ state: GraphState }>;
-  setClusterLoopPolicy: (input: SetClusterLoopPolicyInput) => Promise<{ state: GraphState }>;
-  updateNodePositions: (input: UpdateNodePositionsInput) => Promise<{ ok: boolean; positions: UpdateNodePositionsInput['positions']; updatedAt: string }>;
-  startMasterLoop: (input: StartMasterLoopInput) => Promise<{ state: GraphState }>;
-  stopMasterLoop: (input: StopMasterLoopInput) => Promise<{ state: GraphState }>;
-  stopLoop: (input: StopLoopInput) => Promise<{ state: GraphState }>;
-  stopSubscription: (input: { subscriptionId: string; reason?: string }) => Promise<{ ok: boolean; state: GraphState }>;
-  freeze: (input: FreezeInput) => Promise<{ ok: boolean; state: GraphState }>;
-  unfreeze: (input: UnfreezeInput) => Promise<{ ok: boolean; state: GraphState }>;
-  cleanupChannels: (input: { sessionId?: string; maxReadAgeDays?: number; maxReadEntries?: number; keepLatestReadPerTopic?: boolean; reason?: string }) => Promise<{ ok: boolean; removedDeliveries: number; removedBytes: number; state: GraphState }>;
-  getWorkingTreeDiff: (input: WorkingTreeDiffInput) => Promise<WorkingTreeDiffResult>;
-  getWorkspaceFiles: (input: WorkspaceFilesInput) => Promise<WorkspaceFilesResult>;
-  getWorkspaceFileContent: (input: WorkspaceFileContentInput) => Promise<WorkspaceFileContentResult>;
-  openWorkspace: (input: OpenWorkspaceInput) => Promise<OpenWorkspaceResult>;
-  createTerminal: (input: CreateTerminalInput) => Promise<RuntimeTerminalResult>;
-  getTerminal: (input: GetTerminalInput) => Promise<RuntimeTerminalResult>;
-  runTerminalCommand: (input: RunTerminalCommandInput) => Promise<RunTerminalCommandResult>;
-  writeTerminalInput: (input: WriteTerminalInput) => Promise<RuntimeTerminalResult>;
-  clearTerminal: (input: ClearTerminalInput) => Promise<RuntimeTerminalResult>;
-  closeTerminal: (input: CloseTerminalInput) => Promise<RuntimeTerminalResult>;
-  onEvent: (listener: (event: RuntimeEvent) => void) => () => void;
-};
-
-export type ElectronOrreryApi = {
-  platform: string;
-  workspace?: RuntimeWorkspaceMetadata;
-  updates: {
-    getState: () => Promise<AppUpdateState>;
-    checkForUpdates: () => Promise<AppUpdateState>;
-    openReleasePage: () => Promise<void>;
-    installUpdate: () => Promise<AppUpdateState>;
-    onBeforeInstall: (listener: () => AppUpdateReadiness | Promise<AppUpdateReadiness>) => () => void;
-    onState: (listener: (state: AppUpdateState) => void) => () => void;
-  };
-  runtime: RuntimeApi;
-};
+export type { RuntimeWorkspaceMetadata, RuntimeConfig, KernelEventsInput, KernelEventsResult, RuntimeApi, ElectronOrreryApi } from '@shared/runtime-api';
+import type { RuntimeWorkspaceMetadata, RuntimeConfig, KernelEventsInput, RuntimeApi } from '@shared/runtime-api';
 
 type ElectronRuntimeClient = {
   kind: 'electron';
@@ -351,270 +187,127 @@ class HttpRuntimeApi implements RuntimeApi {
     return normalizeGraphState(await this.#get('state'));
   }
 
-  getProjectContext(input: ProjectContextInput) {
-    return this.#post<ProjectContext>('project-context', input);
-  }
+  getProjectContext(input: ProjectContextInput) { return this.#call('getProjectContext', input); }
 
-  getProviderSetupStatus(input: ProviderSetupStatusInput) {
-    return this.#post<ProviderSetupStatus>('provider-setup-status', input);
-  }
+  getProviderSetupStatus(input: ProviderSetupStatusInput) { return this.#call('getProviderSetupStatus', input); }
 
-  upsertProviderInstance(input: UpsertProviderInstanceInput) {
-    return this.#post<{ providerInstance: ProviderInstance; state: GraphState }>('provider-instances', input);
-  }
+  upsertProviderInstance(input: UpsertProviderInstanceInput) { return this.#call('upsertProviderInstance', input); }
 
   async chooseProjectFolder() {
     return { canceled: true };
   }
 
-  listNativeSessions(input: ListNativeSessionsInput) {
-    return this.#post<ListNativeSessionsResult>('native-sessions/list', input);
-  }
+  listNativeSessions(input: ListNativeSessionsInput) { return this.#call('listNativeSessions', input); }
 
-  readNativeSession(input: ReadNativeSessionInput) {
-    return this.#post<NativeSessionDetails>('native-sessions/read', input);
-  }
+  readNativeSession(input: ReadNativeSessionInput) { return this.#call('readNativeSession', input); }
 
-  importNativeSession(input: ImportNativeSessionInput) {
-    return this.#post<ImportNativeSessionResult<GraphState>>('native-sessions/import', input);
-  }
+  importNativeSession(input: ImportNativeSessionInput) { return this.#call('importNativeSession', input); }
 
-  createSession(input: CreateRuntimeSessionInput) {
-    return this.#post<CreateRuntimeSessionResult>('sessions', input);
-  }
+  createSession(input: CreateRuntimeSessionInput) { return this.#call('createSession', input); }
 
-  forkSession(input: ForkRuntimeSessionInput) {
-    return this.#post<ForkRuntimeSessionResult>(`sessions/${encodeURIComponent(input.sessionId)}/fork`, input);
-  }
+  forkSession(input: ForkRuntimeSessionInput) { return this.#call('forkSession', input); }
 
-  resumeSession(input: ResumeRuntimeSessionInput) {
-    return this.#post<{ ok: boolean; state: GraphState }>(`sessions/${encodeURIComponent(input.sessionId)}/resume`, input);
-  }
+  resumeSession(input: ResumeRuntimeSessionInput) { return this.#call('resumeSession', input); }
 
-  setThreadGoal(input: SetThreadGoalInput) {
-    const path = input.sessionId
-      ? `sessions/${encodeURIComponent(input.sessionId)}/goal`
-      : 'sessions/goal';
-    return this.#post<{ ok?: boolean; sessionId?: SessionId; state: GraphState }>(path, input);
-  }
+  setThreadGoal(input: SetThreadGoalInput) { return this.#call('setThreadGoal', input); }
 
-  clearThreadGoal(input: ClearThreadGoalInput) {
-    return this.#post<{ ok: boolean; state: GraphState }>(`sessions/${encodeURIComponent(input.sessionId)}/goal/clear`, input);
-  }
+  clearThreadGoal(input: ClearThreadGoalInput) { return this.#call('clearThreadGoal', input); }
 
-  archiveSession(input: ArchiveRuntimeSessionInput) {
-    return this.#post<{ ok: boolean; state: GraphState }>(`sessions/${encodeURIComponent(input.sessionId)}/archive`, input);
-  }
+  archiveSession(input: ArchiveRuntimeSessionInput) { return this.#call('archiveSession', input); }
 
-  killSession(sessionId: SessionId) {
-    return this.#post<{ ok: boolean; state: GraphState }>(`sessions/${encodeURIComponent(sessionId)}/kill`);
-  }
+  killSession(sessionId: SessionId) { return this.#call('killSession', sessionId); }
 
-  respondRuntimeRequest(input: RespondRuntimeRequestInput) {
-    return this.#post<{ ok: boolean; state: GraphState }>(`requests/${encodeURIComponent(input.requestId)}/respond`, input);
-  }
+  respondRuntimeRequest(input: RespondRuntimeRequestInput) { return this.#call('respondRuntimeRequest', input); }
 
-  answerUserInput(input: AnswerUserInputInput) {
-    return this.#post<{ ok: boolean; state: GraphState }>(`user-input/${encodeURIComponent(input.requestId)}/answer`, input);
-  }
+  answerUserInput(input: AnswerUserInputInput) { return this.#call('answerUserInput', input); }
 
-  upsertCluster(input: UpsertClusterInput) {
-    return this.#post<{ clusterId: string; state: GraphState }>('clusters', input);
-  }
+  upsertCluster(input: UpsertClusterInput) { return this.#call('upsertCluster', input); }
 
-  createMasterForCluster(input: CreateMasterForClusterInput) {
-    return this.#post<{ sessionId: SessionId; state: GraphState }>(`clusters/${encodeURIComponent(input.clusterId)}/master`, input);
-  }
+  createMasterForCluster(input: CreateMasterForClusterInput) { return this.#call('createMasterForCluster', input); }
 
-  assignMasterToCluster(input: AssignMasterToClusterInput) {
-    return this.#post<{ state: GraphState }>(`clusters/${encodeURIComponent(input.clusterId)}/assign-master`, input);
-  }
+  assignMasterToCluster(input: AssignMasterToClusterInput) { return this.#call('assignMasterToCluster', input); }
 
-  setClusterLoopPolicy(input: SetClusterLoopPolicyInput) {
-    return this.#post<{ state: GraphState }>(`clusters/${encodeURIComponent(input.clusterId)}/loop-policy`, input);
-  }
+  setClusterLoopPolicy(input: SetClusterLoopPolicyInput) { return this.#call('setClusterLoopPolicy', input); }
 
-  updateNodePositions(input: UpdateNodePositionsInput) {
-    return this.#post<{ ok: boolean; positions: UpdateNodePositionsInput['positions']; updatedAt: string }>('node-positions', input);
-  }
+  updateNodePositions(input: UpdateNodePositionsInput) { return this.#call('updateNodePositions', input); }
 
-  startMasterLoop(input: StartMasterLoopInput) {
-    return this.#post<{ state: GraphState }>(`clusters/${encodeURIComponent(input.clusterId)}/start-loop`, input);
-  }
+  startMasterLoop(input: StartMasterLoopInput) { return this.#call('startMasterLoop', input); }
 
-  stopMasterLoop(input: StopMasterLoopInput) {
-    return this.#post<{ state: GraphState }>(`clusters/${encodeURIComponent(input.clusterId)}/stop-loop`, input);
-  }
+  stopMasterLoop(input: StopMasterLoopInput) { return this.#call('stopMasterLoop', input); }
 
-  stopLoop(input: StopLoopInput) {
-    return this.#post<{ state: GraphState }>(`loops/${encodeURIComponent(input.loopId)}/stop`, input);
-  }
+  stopLoop(input: StopLoopInput) { return this.#call('stopLoop', input); }
 
-  freeze(input: FreezeInput) {
-    return this.#post<{ ok: boolean; state: GraphState }>('freeze', input);
-  }
+  freeze(input: FreezeInput) { return this.#call('freeze', input); }
 
-  unfreeze(input: UnfreezeInput) {
-    return this.#post<{ ok: boolean; state: GraphState }>('unfreeze', input);
-  }
+  unfreeze(input: UnfreezeInput) { return this.#call('unfreeze', input); }
 
-  cleanupChannels(input: { sessionId?: string; maxReadAgeDays?: number; maxReadEntries?: number; keepLatestReadPerTopic?: boolean; reason?: string }) {
-    return this.#post<{ ok: boolean; removedDeliveries: number; removedBytes: number; state: GraphState }>('channels/cleanup', input);
-  }
+  cleanupChannels(input: { sessionId?: string; maxReadAgeDays?: number; maxReadEntries?: number; keepLatestReadPerTopic?: boolean; reason?: string }) { return this.#call('cleanupChannels', input); }
 
-  getWorkingTreeDiff(input: WorkingTreeDiffInput) {
-    return this.#post<WorkingTreeDiffResult>('working-tree-diff', input);
-  }
+  getWorkingTreeDiff(input: WorkingTreeDiffInput) { return this.#call('getWorkingTreeDiff', input); }
 
-  getWorkspaceFiles(input: WorkspaceFilesInput) {
-    return this.#post<WorkspaceFilesResult>('workspace-files', input);
-  }
+  getWorkspaceFiles(input: WorkspaceFilesInput) { return this.#call('getWorkspaceFiles', input); }
 
-  getWorkspaceFileContent(input: WorkspaceFileContentInput) {
-    return this.#post<WorkspaceFileContentResult>('workspace-file-content', input);
-  }
+  getWorkspaceFileContent(input: WorkspaceFileContentInput) { return this.#call('getWorkspaceFileContent', input); }
 
-  openWorkspace(input: OpenWorkspaceInput) {
-    return this.#post<OpenWorkspaceResult>('open-workspace', input);
-  }
+  openWorkspace(input: OpenWorkspaceInput) { return this.#call('openWorkspace', input); }
 
-  createTerminal(input: CreateTerminalInput) {
-    return this.#post<RuntimeTerminalResult>('terminals', input);
-  }
+  createTerminal(input: CreateTerminalInput) { return this.#call('createTerminal', input); }
 
-  getTerminal(input: GetTerminalInput) {
-    return this.#get<RuntimeTerminalResult>(`terminals/${encodeURIComponent(input.terminalId)}`);
-  }
+  getTerminal(input: GetTerminalInput) { return this.#call('getTerminal', input); }
 
-  getKernelEvents(input?: KernelEventsInput) {
-    const params = new URLSearchParams();
-    if (input?.since !== undefined) {
-      params.set('since', String(input.since));
-    }
-    if (input?.limit !== undefined) {
-      params.set('limit', String(input.limit));
-    }
-    if (input?.tail) {
-      params.set('tail', 'true');
-    }
-    const query = params.size > 0 ? `?${params.toString()}` : '';
-    return this.#get<KernelEventsResult>(`kernel-events${query}`);
-  }
+  getKernelEvents(input?: KernelEventsInput) { return this.#call('getKernelEvents', input); }
 
-  dispatchCommand(input: { commandId?: string; idempotencyKey?: string; expectedVersion?: number; kind: string; reason?: string; input?: Record<string, unknown> }) {
-    return this.#post<Record<string, unknown>>('commands', input);
-  }
+  dispatchCommand(input: { commandId?: string; idempotencyKey?: string; expectedVersion?: number; kind: string; reason?: string; input?: Record<string, unknown> }) { return this.#call('dispatchCommand', input); }
 
-  getLoopTimeline(input: { loopId: string }) {
-    return this.#get<LoopTimelineResult>(`loops/${encodeURIComponent(input.loopId)}/timeline`);
-  }
+  getLoopTimeline(input: { loopId: string }) { return this.#call('getLoopTimeline', input); }
 
-  createGoalLoop(input: CreateGoalLoopInput) {
-    return this.#post<CreateGoalLoopResult>('goal-loops', input);
-  }
+  createGoalLoop(input: CreateGoalLoopInput) { return this.#call('createGoalLoop', input); }
 
-  startReviewWorkflow(input: StartReviewWorkflowInput) {
-    return this.#post<StartReviewWorkflowResult>('review-workflows', input);
-  }
+  startReviewWorkflow(input: StartReviewWorkflowInput) { return this.#call('startReviewWorkflow', input); }
 
-  startPlanCouncil(input: StartPlanCouncilInput) {
-    return this.#post<StartPlanCouncilResult>('plan-councils', input);
-  }
+  startPlanCouncil(input: StartPlanCouncilInput) { return this.#call('startPlanCouncil', input); }
 
-  getPlanCouncil(input: { workflowId: string }) {
-    return this.#get<{ council: PlanCouncil }>(`plan-councils/${encodeURIComponent(input.workflowId)}`);
-  }
+  getPlanCouncil(input: { workflowId: string }) { return this.#call('getPlanCouncil', input); }
 
-  getPlanCouncilArtifact(input: { workflowId: string; artifactId: string }) {
-    return this.#get<{ artifact: PlanCouncil['artifacts'][number]; content: string }>(
-      `plan-councils/${encodeURIComponent(input.workflowId)}/artifacts/${encodeURIComponent(input.artifactId)}`,
-    );
-  }
+  getPlanCouncilArtifact(input: { workflowId: string; artifactId: string }) { return this.#call('getPlanCouncilArtifact', input); }
 
-  startPlanCouncilCrossReview(input: { workflowId: string }) {
-    return this.#post<{ council: PlanCouncil; state: GraphState }>(
-      `plan-councils/${encodeURIComponent(input.workflowId)}/cross-review`,
-      {},
-    );
-  }
+  startPlanCouncilCrossReview(input: { workflowId: string }) { return this.#call('startPlanCouncilCrossReview', input); }
 
-  startPlanCouncilSynthesis(input: { workflowId: string }) {
-    return this.#post<{ council: PlanCouncil; state: GraphState }>(
-      `plan-councils/${encodeURIComponent(input.workflowId)}/synthesis`,
-      {},
-    );
-  }
+  startPlanCouncilSynthesis(input: { workflowId: string }) { return this.#call('startPlanCouncilSynthesis', input); }
 
-  stopPlanCouncil(input: { workflowId: string; reason?: string }) {
-    return this.#post<{ council: PlanCouncil; state: GraphState }>(
-      `plan-councils/${encodeURIComponent(input.workflowId)}/stop`,
-      { reason: input.reason },
-    );
-  }
+  stopPlanCouncil(input: { workflowId: string; reason?: string }) { return this.#call('stopPlanCouncil', input); }
 
-  startDraftWorkflow(input: StartDraftWorkflowInput) {
-    return this.#post<StartDraftWorkflowResult>('draft-workflows', input);
-  }
+  startDraftWorkflow(input: StartDraftWorkflowInput) { return this.#call('startDraftWorkflow', input); }
 
-  startHandoffWorkflow(input: StartHandoffWorkflowInput) {
-    return this.#post<StartHandoffWorkflowResult>('handoff-workflows', input);
-  }
+  startHandoffWorkflow(input: StartHandoffWorkflowInput) { return this.#call('startHandoffWorkflow', input); }
 
-  startGoalWorkflow(input: StartGoalWorkflowInput) {
-    return this.#post<StartGoalWorkflowResult>('goal-workflows/start', input);
-  }
+  startGoalWorkflow(input: StartGoalWorkflowInput) { return this.#call('startGoalWorkflow', input); }
 
-  connectAgents(input: ConnectAgentsInput) {
-    return this.#post<ConnectAgentsResult>('agent-connections', input);
-  }
+  connectAgents(input: ConnectAgentsInput) { return this.#call('connectAgents', input); }
 
-  stopSubscription(input: { subscriptionId: string; reason?: string }) {
-    return this.#post<{ ok: boolean; state: GraphState }>(`subscriptions/${encodeURIComponent(input.subscriptionId)}/stop`, input);
-  }
+  stopSubscription(input: { subscriptionId: string; reason?: string }) { return this.#call('stopSubscription', input); }
 
-  registerExternalSource(input: RegisterExternalSourceInput) {
-    return this.#post<RegisterExternalSourceResult>('sources', input);
-  }
+  registerExternalSource(input: RegisterExternalSourceInput) { return this.#call('registerExternalSource', input); }
 
-  removeExternalSource(input: { sourceId: string; reason?: string }) {
-    return this.#post<{ ok: boolean }>(`sources/${encodeURIComponent(input.sourceId)}/remove`, input);
-  }
+  removeExternalSource(input: { sourceId: string; reason?: string }) { return this.#call('removeExternalSource', input); }
 
-  emitExternalEvent(input: EmitExternalEventInput) {
-    return this.#post<EmitExternalEventResult>('external-events', input);
-  }
+  emitExternalEvent(input: EmitExternalEventInput) { return this.#call('emitExternalEvent', input); }
 
-  listTemplates() {
-    return this.#get<ListTemplatesResult>('templates');
-  }
+  listTemplates() { return this.#call('listTemplates', undefined); }
 
-  applyTemplate(input: ApplyTemplateInput) {
-    return this.#post<ApplyTemplateResult>('templates/apply', input);
-  }
+  applyTemplate(input: ApplyTemplateInput) { return this.#call('applyTemplate', input); }
 
-  saveTemplate(input: SaveTemplateInput) {
-    return this.#post<SaveTemplateResult>('templates/save', input);
-  }
+  saveTemplate(input: SaveTemplateInput) { return this.#call('saveTemplate', input); }
 
-  removeTemplate(input: { templateId: string }) {
-    return this.#post<{ ok: boolean; state: GraphState }>(`templates/${encodeURIComponent(input.templateId)}/remove`, input);
-  }
+  removeTemplate(input: { templateId: string }) { return this.#call('removeTemplate', input); }
 
-  runTerminalCommand(input: RunTerminalCommandInput) {
-    return this.#post<RunTerminalCommandResult>(`terminals/${encodeURIComponent(input.terminalId)}/command`, input);
-  }
+  runTerminalCommand(input: RunTerminalCommandInput) { return this.#call('runTerminalCommand', input); }
 
-  writeTerminalInput(input: WriteTerminalInput) {
-    return this.#post<RuntimeTerminalResult>(`terminals/${encodeURIComponent(input.terminalId)}/stdin`, input);
-  }
+  writeTerminalInput(input: WriteTerminalInput) { return this.#call('writeTerminalInput', input); }
 
-  clearTerminal(input: ClearTerminalInput) {
-    return this.#post<RuntimeTerminalResult>(`terminals/${encodeURIComponent(input.terminalId)}/clear`, input);
-  }
+  clearTerminal(input: ClearTerminalInput) { return this.#call('clearTerminal', input); }
 
-  closeTerminal(input: CloseTerminalInput) {
-    return this.#post<RuntimeTerminalResult>(`terminals/${encodeURIComponent(input.terminalId)}/close`, input);
-  }
+  closeTerminal(input: CloseTerminalInput) { return this.#call('closeTerminal', input); }
 
   onEvent(listener: (event: RuntimeEvent) => void) {
     const source = new EventSource(this.#url('events'));
@@ -641,12 +334,13 @@ class HttpRuntimeApi implements RuntimeApi {
     };
   }
 
-  #get<T = unknown>(path: string) {
-    return this.#request<T>('GET', path);
+  #call<K extends RuntimeOperationName>(name: K, input: RuntimeOperationInput<K>): Promise<RuntimeOperationResult<K>> {
+    const request = runtimeHttpRequest(name, input);
+    return this.#request<RuntimeOperationResult<K>>(request.method, request.path, request.body);
   }
 
-  #post<T>(path: string, input?: unknown) {
-    return this.#request<T>('POST', path, input);
+  #get<T = unknown>(path: string) {
+    return this.#request<T>('GET', path);
   }
 
   async #request<T>(method: 'GET' | 'POST', path: string, body?: unknown) {

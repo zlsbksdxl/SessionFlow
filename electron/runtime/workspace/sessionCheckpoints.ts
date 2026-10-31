@@ -13,10 +13,7 @@ import {
   now,
 } from '../runtimeCommon.js'
 import {
-  checkpointRef,
-  checkpointSessionRefRoot,
   emptyGitTree,
-  gitCheckpointEnv,
   gitDiffMaxBuffer,
   gitOutput,
   gitRepoRoot,
@@ -26,12 +23,15 @@ import {
   totalsForDiffFiles,
 } from './gitWorkspace.js'
 
+import { GitCheckpointService } from './gitCheckpointService.js'
+import type { RuntimeRunContext } from '../sessions/runtimeRunContext.js'
+
 const uiPatchMaxLength = 2 * 1024 * 1024
 
 // The minimal manager surface the checkpoint/diff projections need.
 export type CheckpointHost = {
   readonly state: JsonRecord
-  readonly runContext: Map<string, JsonRecord>
+  readonly runContext: Map<string, RuntimeRunContext>
   appendProviderRuntimeEvent(sessionId: string, event: JsonRecord): void
 }
 
@@ -41,67 +41,6 @@ export function completedTurnCount(host: CheckpointHost, session) {
   ).length
 }
 
-export function captureTurnCheckpoint(host: CheckpointHost, { sessionId, turnId, turnCount, stage }) {
-  const session = host.state.sessions[sessionId]
-  if (session?.workspaceConnection?.kind === 'ssh') throw new Error('Local Git checkpoints are unavailable for SSH workspaces.')
-  if (!session) {
-    throw new Error(`Unknown session: ${sessionId}`)
-  }
-
-  const cwd = validateRunnableCwd(session.cwd)
-  let repoRoot
-  try {
-    gitOutput(cwd, ['rev-parse', '--is-inside-work-tree'])
-    repoRoot = gitOutput(cwd, ['rev-parse', '--show-toplevel'])
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    throw new Error(
-      `Project folder is not a Git work tree: ${cwd}. ${message}`,
-    )
-  }
-
-  const ref = checkpointRef({
-    sessionId,
-    turnCount,
-    turnId,
-    stage,
-  })
-  const tempIndex = path.join(
-    os.tmpdir(),
-    `orrery-checkpoint-${process.pid}-${randomUUID()}.index`,
-  )
-  const env = gitCheckpointEnv(tempIndex)
-
-  try {
-    const hasHead = hasGitHead(cwd, env)
-    const indexTree = hasHead ? gitOutput(cwd, ['write-tree']) : emptyGitTree
-    gitOutput(cwd, ['read-tree', indexTree], { env })
-    gitOutput(cwd, ['add', '-A', '--', '.'], { env })
-    const tree = gitOutput(cwd, ['write-tree'], { env })
-    const commitArgs = ['commit-tree', tree]
-    if (hasHead) {
-      commitArgs.push('-p', gitOutput(cwd, ['rev-parse', 'HEAD']))
-    }
-    const commit = gitOutput(cwd, commitArgs, { env })
-    gitOutput(cwd, ['update-ref', ref, commit])
-
-    return {
-      ref,
-      commit,
-      cwd,
-      repoRoot,
-      turnCount,
-      stage,
-    }
-  } finally {
-    try {
-      fs.rmSync(tempIndex, { force: true })
-      fs.rmSync(`${tempIndex}.lock`, { force: true })
-    } catch {
-      // Best-effort cleanup; the temp index is outside the user's repo.
-    }
-  }
-}
 
 export function diffSummaryForCheckpointRange(host: CheckpointHost, {
   sessionId,
@@ -155,150 +94,67 @@ export function diffSummaryForCheckpointRange(host: CheckpointHost, {
   }
 }
 
-export function recordTurnCheckpointDiff(host: CheckpointHost, sessionId, ts) {
+export function recordTurnCheckpointDiff(host: CheckpointHost, sessionId: string, ts: string, service: GitCheckpointService): Promise<void> | undefined {
   const session = host.state.sessions[sessionId]
   if (session?.workspaceConnection?.kind === 'ssh') return
   const context = host.runContext.get(sessionId)
-  if (!session || !context || context.turnDiffRecorded === true) {
-    return
-  }
+  if (!session || !context) return
+  if (context.turnDiffPromise) return context.turnDiffPromise
+  if (context.turnDiffRecorded === true) return
 
   context.turnDiffRecorded = true
   const turnId = context.runId
-  const fromTurnCount = Number.isInteger(
-    context.turnCheckpoint?.fromTurnCount,
-  )
-    ? context.turnCheckpoint.fromTurnCount
-    : completedTurnCount(host, session)
+  const fromTurnCount = Number.isInteger(context.turnCheckpoint?.fromTurnCount)
+    ? context.turnCheckpoint.fromTurnCount : completedTurnCount(host, session)
   const toTurnCount = fromTurnCount + 1
+  const append = (diff) => {
+    if (host.runContext.get(sessionId) !== context || !host.state.sessions[sessionId]) return
+    host.appendProviderRuntimeEvent(sessionId, {
+      id: randomUUID(), ts, type: 'turn.diff.updated', sessionId, turnId, diff,
+    })
+  }
+  const failure = (error: string) => append({
+    sessionId, turnId, cwd: session.cwd, generatedAt: ts,
+    files: [], totals: { files: 0, additions: 0, deletions: 0 }, error,
+  })
 
   if (context.turnCheckpoint?.error || !context.turnCheckpoint?.ref) {
-    host.appendProviderRuntimeEvent(sessionId, {
-      id: randomUUID(),
-      ts,
-      type: 'turn.diff.updated',
-      sessionId,
-      turnId,
-      diff: {
-        sessionId,
-        turnId,
-        cwd: session.cwd,
-        generatedAt: ts,
-        files: [],
-        totals: { files: 0, additions: 0, deletions: 0 },
-        error:
-          context.turnCheckpoint?.error ??
-          'No baseline checkpoint was captured for this turn.',
-      },
-    })
+    failure(context.turnCheckpoint?.error ?? 'No baseline checkpoint was captured for this turn.')
     return
   }
 
-  try {
-    const after = captureTurnCheckpoint(host, {
-      sessionId,
-      turnId,
-      turnCount: toTurnCount,
-      stage: 'after',
-    })
-    const diff = diffSummaryForCheckpointRange(host, {
-      sessionId,
-      turnId,
-      cwd: after.cwd,
-      repoRoot: after.repoRoot,
-      fromCheckpointRef: context.turnCheckpoint.ref,
-      toCheckpointRef: after.ref,
-      fromTurnCount,
-      toTurnCount,
-    })
-
-    const { patch: _patch, ...summary } = diff
-    host.appendProviderRuntimeEvent(sessionId, {
-      id: randomUUID(),
-      ts,
-      type: 'turn.diff.updated',
-      sessionId,
-      turnId,
-      diff: summary,
-    })
-  } catch (error) {
-    host.appendProviderRuntimeEvent(sessionId, {
-      id: randomUUID(),
-      ts,
-      type: 'turn.diff.updated',
-      sessionId,
-      turnId,
-      diff: {
-        sessionId,
-        turnId,
-        cwd: session.cwd,
-        generatedAt: ts,
-        files: [],
-        totals: { files: 0, additions: 0, deletions: 0 },
-        error: error instanceof Error ? error.message : String(error),
-      },
-    })
-  }
+  const operation = service.complete({
+    cwd: session.cwd, sessionId, turnId,
+    fromCheckpointRef: context.turnCheckpoint.ref, fromTurnCount, toTurnCount,
+  }).then(async (diff) => {
+    append(diff)
+    // appendProviderRuntimeEvent queues ref retention. Keep the turn busy
+    // until that cleanup is done, matching the former synchronous boundary.
+    await service.settled(session.cwd)
+  }).catch(async (error: unknown) => {
+    failure(error instanceof Error ? error.message : String(error))
+    await service.settled(session.cwd)
+  })
+  context.turnDiffPromise = operation
+  return operation
 }
 
-export function pruneTurnCheckpointRefs(host: CheckpointHost, sessionId) {
+/** Snapshot retained refs on the runtime thread; perform Git I/O in the service queue. */
+export function pruneTurnCheckpointRefsAsync(host: CheckpointHost, sessionId: string, service: GitCheckpointService): Promise<void> {
   const session = host.state.sessions[sessionId]
-  if (session?.workspaceConnection?.kind === 'ssh') return
-  if (!session) {
-    return
-  }
-
-  let cwd
-  try {
-    cwd = validateRunnableCwd(session.cwd)
-  } catch {
-    return
-  }
-
-  const keepRefs = new Set()
-  const activeContext = host.runContext.get(sessionId)
-  if (nonEmptyString(activeContext?.turnCheckpoint?.ref)) {
-    keepRefs.add(activeContext.turnCheckpoint.ref)
-  }
-
+  if (!session || session.workspaceConnection?.kind === 'ssh') return Promise.resolve()
+  const keepRefs = new Set<string>()
+  const context = host.runContext.get(sessionId)
+  if (nonEmptyString(context?.turnCheckpoint?.ref)) keepRefs.add(context.turnCheckpoint.ref)
   for (const event of session.runtimeEvents ?? []) {
-    if (event.type !== 'turn.diff.updated' || !isObject(event.diff?.range)) {
-      continue
-    }
-    const { fromCheckpointRef, toCheckpointRef } = event.diff.range
-    if (nonEmptyString(fromCheckpointRef)) {
-      keepRefs.add(fromCheckpointRef)
-    }
-    if (nonEmptyString(toCheckpointRef)) {
-      keepRefs.add(toCheckpointRef)
+    if (event.type !== 'turn.diff.updated' || !isObject(event.diff?.range)) continue
+    for (const ref of [event.diff.range.fromCheckpointRef, event.diff.range.toCheckpointRef]) {
+      if (nonEmptyString(ref)) keepRefs.add(ref)
     }
   }
-
-  let refs
-  try {
-    refs = gitOutput(cwd, [
-      'for-each-ref',
-      '--format=%(refname)',
-      checkpointSessionRefRoot(sessionId),
-    ])
-      .split('\n')
-      .map((ref) => ref.trim())
-      .filter(Boolean)
-  } catch {
-    return
-  }
-
-  for (const ref of refs) {
-    if (keepRefs.has(ref)) {
-      continue
-    }
-    try {
-      gitOutput(cwd, ['update-ref', '-d', ref])
-    } catch {
-      // Stale checkpoint cleanup is best-effort; the persisted diff event remains authoritative.
-    }
-  }
+  return service.prune(session.cwd, sessionId, [...keepRefs])
 }
+
 
 export function gitDiffForSession(host: CheckpointHost, sessionId) {
   try {

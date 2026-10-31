@@ -1,10 +1,8 @@
-import { type Dispatch, type SetStateAction, useCallback, useEffect, useState } from 'react';
+import { type Dispatch, type SetStateAction, useCallback, useEffect, useMemo, useState } from 'react';
 
 import type { AgentSession, GraphState, RuntimeStateDiagnostic } from '@/shared/graph-state';
 import type { RuntimeApi } from '@/runtime-client';
-import { latestReportForSession } from '@/lib/reports';
-import { sessionRecoveryState } from '@/lib/diagnostics';
-import { sessionMatchesSearch } from '@/lib/session-display';
+import { buildSessionListModel } from '@/lib/sidebar-model';
 
 const pinnedSessionIdsStorageKey = 'orrery.pinnedSessionIds.v1';
 
@@ -63,36 +61,18 @@ export function useSessionList({
     setPinnedSessionIds((current) => (current.includes(sessionId) ? current.filter((id) => id !== sessionId) : [sessionId, ...current]));
   }, []);
 
-  const runningSessions = sessions.filter((session) => session.status === 'running' || session.status === 'pending');
-  const archivedSessionCount = sessions.filter((session) => session.archived).length;
-  const pinnedSessionOrder = new Map(pinnedSessionIds.map((id, index) => [id, index]));
-  const filteredSessions = sessions
-    .filter((session) => {
-      if (session.archived && !showArchivedSessions) {
-        return false;
-      }
-
-      const node = runtimeState.nodes.find((candidate) => candidate.sessionId === session.sessionId);
-      const managedCluster = Object.values(runtimeState.clusters).find((cluster) => cluster.nodeIds.includes(session.sessionId));
-      const latestReport = latestReportForSession(runtimeState.reports, session.sessionId);
-      const recovery = sessionRecoveryState({
-        session,
+  const model = useMemo(
+    () =>
+      buildSessionListModel({
+        state: runtimeState,
+        sessions,
         diagnostics: runtimeDiagnostics,
-        frozen: node?.frozen === true || managedCluster?.frozen === true,
-      });
-
-      return sessionMatchesSearch({
-        session,
-        latestReport,
-        recovery,
         query: sessionSearch,
-      });
-    })
-    .sort(
-      (left, right) =>
-        (pinnedSessionOrder.get(left.sessionId) ?? pinnedSessionIds.length) - (pinnedSessionOrder.get(right.sessionId) ?? pinnedSessionIds.length),
-    );
-
+        showArchived: showArchivedSessions,
+        pinnedIds: pinnedSessionIds,
+      }),
+    [runtimeState, sessions, runtimeDiagnostics, sessionSearch, showArchivedSessions, pinnedSessionIds],
+  );
   const setSessionArchived = useCallback(
     async (sessionId: string, archived: boolean) => {
       if (!runtimeApi) {
@@ -133,9 +113,7 @@ export function useSessionList({
     archivingSessionIds,
     pinnedSessionIds,
     toggleSessionPinned,
-    runningSessions,
-    archivedSessionCount,
-    filteredSessions,
+    ...model,
     setSessionArchived,
   };
 }

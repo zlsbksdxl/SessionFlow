@@ -444,6 +444,26 @@ function rawEnvelope(message) {
 
 const requestTimeoutMs = 30 * 60 * 1000
 
+function notificationThreadIds(message): string[] {
+  const params = message.params ?? {}
+  // Correlate the notification's owner, not participant references embedded
+  // in a collaboration tool or turn.rootTurnId (a child can name its parent).
+  return [
+    params.threadId,
+    params.thread_id,
+    params.thread?.id,
+    params.turn?.threadId,
+    params.turn?.thread_id,
+    params.goal?.threadId,
+  ].filter((value): value is string => typeof value === 'string' && value.length > 0)
+}
+
+function notificationTurnIds(message): string[] {
+  const params = message.params ?? {}
+  return [params.turnId, params.turn_id, params.turn?.id]
+    .filter((value): value is string => typeof value === 'string' && value.length > 0)
+}
+
 export class CodexAppServerRun extends EventEmitter {
   #client
   #closed = false
@@ -464,6 +484,8 @@ export class CodexAppServerRun extends EventEmitter {
   #goalOperationReady = false
   #goalControlTail = Promise.resolve()
   #goalPauseObserved = false
+  #notificationsReady = false
+  #bufferedNotifications: Array<{ method: string; params?: Record<string, any> }> = []
 
   constructor({
     prompt,
@@ -621,6 +643,7 @@ export class CodexAppServerRun extends EventEmitter {
       }
 
       if (this.#isGoalRun()) {
+        this.#releaseNotifications()
         const goal = await this.#queueGoalOperation(this.#providerOperation)
         if (goal?.status === 'active' && !this.#goalSettled) {
           await new Promise<void>((resolve, reject) => {
@@ -645,6 +668,7 @@ export class CodexAppServerRun extends EventEmitter {
           { timeoutMs: 30000 }
         )
         this.#codexTurnId = turnResult?.turn?.id
+        this.#releaseNotifications()
 
         if (!this.#turnCompleted) {
         await new Promise<void>((resolve, reject) => {
@@ -687,6 +711,7 @@ export class CodexAppServerRun extends EventEmitter {
       }
     } finally {
       this.#closed = true
+      this.#bufferedNotifications = []
       this.#clearPendingRequests()
       this.#client?.close()
       cleanupMcpHandoff(this.#mcpHandoff)
@@ -725,6 +750,23 @@ export class CodexAppServerRun extends EventEmitter {
   }
 
   #handleNotification(message) {
+    if (this.#closed) return
+    if (!this.#notificationsReady) {
+      // start/resume/fork and turn/start may emit notifications before their
+      // RPC response. Wait for the authoritative owner ids before projecting
+      // them; in particular a child turn must not become the root turn id.
+      this.#bufferedNotifications.push(message)
+      return
+    }
+    if (
+      this.#threadId &&
+      notificationThreadIds(message).some((threadId) => threadId !== this.#threadId)
+    ) return
+    if (
+      !this.#isGoalRun() && this.#codexTurnId &&
+      notificationTurnIds(message).some((turnId) => turnId !== this.#codexTurnId)
+    ) return
+
     if (message.method === 'turn/started') {
       this.#codexTurnId = message.params?.turn?.id ?? this.#codexTurnId
     }
@@ -765,6 +807,13 @@ export class CodexAppServerRun extends EventEmitter {
         this.emit('turnCompleted')
       }
     }
+  }
+
+  #releaseNotifications() {
+    this.#notificationsReady = true
+    const messages = this.#bufferedNotifications
+    this.#bufferedNotifications = []
+    for (const message of messages) this.#handleNotification(message)
   }
 
   #isGoalRun() {

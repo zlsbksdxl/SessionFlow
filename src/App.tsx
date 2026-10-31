@@ -7,13 +7,10 @@ import { cn } from '@/lib/utils';
 import { chatPanelMinWidth } from '@/lib/layout-prefs';
 import { RuntimeDiagnosticsToast } from '@/components/recovery';
 
-import { type RailTab } from '@/lib/layout-prefs';
 import { SidebarRail } from '@/components/sidebar-rail';
 import { OrchestratePanel } from '@/components/orchestrate-panel';
 import { ChatDetail } from '@/components/chat-detail';
 import { SessionGraphPanel } from '@/components/session-graph-panel';
-import { SessionWorkspacePanel } from '@/components/session-workspace-panel';
-import { TemplateLibraryPanel } from '@/components/template-library';
 import { useRuntimeCore } from '@/hooks/use-runtime-core';
 import { useLayoutPrefs } from '@/hooks/use-layout-prefs';
 import { useComposer } from '@/hooks/use-composer';
@@ -29,28 +26,16 @@ import { useCanvas } from '@/hooks/use-canvas';
 import { useOrchestration } from '@/hooks/use-orchestration';
 import { useDraftGraph } from '@/hooks/use-draft-graph';
 import { useAppUpdateRestartGuard } from '@/hooks/use-app-update-restart-guard';
-import { PlanCouncilWorkbench } from '@/components/plan-council-workbench';
 import { AgentSettingsPanel } from '@/components/agent-settings-panel';
 import { AppearanceSettingsPanel } from '@/components/appearance-settings-panel';
-import { NativeSessionImportDialog } from '@/components/native-session-import-dialog';
 import { preferRuntimeSnapshot } from '../shared/runtime-state-patch';
 import { defaultWorkspaceCwd, latestSessionCwd } from '@/lib/workspace';
+import { useWorkspaceNavigation } from '@/hooks/use-workspace-navigation';
+import { WorkspaceOverlays } from '@/components/workspace-overlays';
 
 function App() {
-  const [activeTab, setActiveTab] = useState<RailTab>('chat');
-  const [showRawEvents, setShowRawEvents] = useState(false);
-  const [providerSetupSessionId, setProviderSetupSessionId] = useState<string>();
-  const [isWorkspacePanelOpen, setIsWorkspacePanelOpen] = useState(false);
-  const [isWorkflowLibraryOpen, setIsWorkflowLibraryOpen] = useState(false);
-  const [isNativeSessionImportOpen, setIsNativeSessionImportOpen] = useState(false);
   const [selectedCanvasNodeIds, setSelectedCanvasNodeIds] = useState<string[]>([]);
   const [activeClusterId, setActiveClusterId] = useState<string>();
-  const [workflowNotice, setWorkflowNotice] = useState<string>();
-  const [openLoopId, setOpenLoopId] = useState<string>();
-  const [openPlanCouncilId, setOpenPlanCouncilId] = useState<string>();
-  const [selectedWorkspaceId, setSelectedWorkspaceId] = useState<string>();
-  const [returnToWorkspaceId, setReturnToWorkspaceId] = useState<string>();
-  const [workspaceDraft, setWorkspaceDraft] = useState<{ workspaceId: string; text: string }>();
   const workflowCloseRequestRef = useRef<(() => void) | undefined>(undefined);
 
   const core = useRuntimeCore();
@@ -86,7 +71,27 @@ function App() {
     adjustChatPanelWidth,
     effectiveGraphCollapsed,
   } = layout;
-  const openPlanCouncil = openPlanCouncilId ? runtimeState.planCouncils?.[openPlanCouncilId] : undefined;
+  const navigation = useWorkspaceNavigation({ setSelectedSessionId, setGraphCollapsed });
+  const {
+    activeTab,
+    setActiveTab,
+    showRawEvents,
+    setShowRawEvents,
+    providerSetupSessionId,
+    setProviderSetupSessionId,
+    isWorkspacePanelOpen,
+    setIsWorkspacePanelOpen,
+    isWorkflowLibraryOpen,
+    setIsWorkflowLibraryOpen,
+    setIsNativeSessionImportOpen,
+    openLoopId,
+    setOpenLoopId,
+    selectedWorkspaceId,
+    setSelectedWorkspaceId,
+    returnToWorkspaceId,
+    workspaceDraft,
+    setWorkspaceDraft,
+  } = navigation;
   const acceptRuntimeState = (incoming: typeof runtimeState) => {
     setRuntimeState((current) => preferRuntimeSnapshot(current, incoming) as typeof runtimeState);
   };
@@ -177,7 +182,7 @@ function App() {
     ingestKernelEvents: core.ingestKernelEvents,
   });
 
-  const actions = useSessionActions({
+  const sessionActions = useSessionActions({
     runtimeApi,
     runtimeUnavailableText,
     runtimeState,
@@ -218,6 +223,23 @@ function App() {
       changeNewProviderKind,
     },
   });
+  const actions = {
+    ...sessionActions,
+    startNewChat: () => {
+      sessionActions.startNewChat();
+      navigation.openNewChat();
+    },
+    startProjectChat: (projectId: string) => {
+      if (!runtimeState.chatProjects?.[projectId]) return;
+      sessionActions.startProjectChat(projectId);
+      navigation.openNewChat();
+    },
+    startLinkedChat: () => {
+      if (!selectedSession) return;
+      sessionActions.startLinkedChat();
+      navigation.openNewChat();
+    },
+  };
   const { setPendingLinkedSourceId } = actions;
 
   const interactions = useInteractions({
@@ -316,48 +338,22 @@ function App() {
           activeTab={activeTab}
           setActiveTab={setSupportedActiveTab}
           selectedWorkspaceId={selectedWorkspaceId}
+          onSelectSession={(sessionId) => {
+            actions.setPendingLinkedSourceId(null);
+            navigation.openChat(sessionId);
+          }}
           onImportChat={() => setIsNativeSessionImportOpen(true)}
           onNewWorkspace={() => {
             if (!requireLocalWorkflow()) return;
-            setOpenPlanCouncilId(undefined);
-            setSelectedWorkspaceId(undefined);
-            setReturnToWorkspaceId(undefined);
-            setActiveTab('workspace');
+            navigation.openWorkspace();
           }}
-          onOpenWorkspace={(id) => {
-            setOpenPlanCouncilId(undefined);
-            setSelectedWorkspaceId(id);
-            setReturnToWorkspaceId(undefined);
-            setActiveTab('workspace');
-          }}
+          onOpenWorkspace={navigation.openWorkspace}
           onStartWorkflow={() => {
             if (!requireLocalWorkflow()) return;
             setGraphCollapsed(false);
             setIsWorkflowLibraryOpen(true);
           }}
         />
-
-        {isNativeSessionImportOpen && runtimeApi ? (
-          <NativeSessionImportDialog
-            runtimeApi={runtimeApi}
-            providerInstances={providerInstances}
-            initialProviderInstanceId={selectedSession?.providerInstanceId ?? newChat.newProviderInstanceId}
-            onClose={() => setIsNativeSessionImportOpen(false)}
-            onImported={(result) => {
-              acceptRuntimeState(result.state);
-              clearComposer();
-              actions.setPendingLinkedSourceId(null);
-              setSelectedSessionId(result.sessionId);
-              setSelectedCanvasNodeIds([result.sessionId]);
-              setSelectedWorkspaceId(undefined);
-              setReturnToWorkspaceId(undefined);
-              setProviderSetupSessionId(undefined);
-              setActiveTab('chat');
-              setGraphCollapsed(false);
-              setIsNativeSessionImportOpen(false);
-            }}
-          />
-        ) : null}
 
         {/* ===== Detail: selected chat or orchestrate ===== */}
         <section
@@ -379,12 +375,8 @@ function App() {
                   onSelectWorkspace={setSelectedWorkspaceId}
                   onStateChange={acceptRuntimeState}
                   onError={setRuntimeError}
-                  onOpenMember={(sessionId) => {
-                    setSelectedSessionId(sessionId);
-                    setReturnToWorkspaceId(selectedWorkspaceId);
-                    setActiveTab('chat');
-                  }}
-                  onOpenCouncil={setOpenPlanCouncilId}
+                  onOpenMember={navigation.openMemberChat}
+                  onOpenCouncil={navigation.openCouncil}
                 />
               </div>
             ) : null}
@@ -407,15 +399,7 @@ function App() {
                     {returnToWorkspaceId &&
                     runtimeState.collaborationSessions?.[returnToWorkspaceId]?.members.some((member) => member.sessionId === selectedSessionId) ? (
                       <div className="border-b border-border px-4 py-2">
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onClick={() => {
-                            setSelectedWorkspaceId(returnToWorkspaceId);
-                            setActiveTab('workspace');
-                            setReturnToWorkspaceId(undefined);
-                          }}
-                        >
+                        <Button variant="ghost" size="sm" onClick={navigation.backToWorkspace}>
                           ← Back to group chat
                         </Button>
                         <span className="ml-2 text-xs text-muted-foreground">Private member chat</span>
@@ -438,10 +422,7 @@ function App() {
                 setProviderSetupSessionId={setProviderSetupSessionId}
                 isWorkspacePanelOpen={isWorkspacePanelOpen}
                 setIsWorkspacePanelOpen={setIsWorkspacePanelOpen}
-                onOpenPlanCouncil={(workflowId) => {
-                  setOpenPlanCouncilId(workflowId);
-                  setGraphCollapsed(false);
-                }}
+                onOpenPlanCouncil={navigation.openCouncil}
                 onOpenAgentSettings={() => setActiveTab('agents')}
                 onShowOnGraph={
                   selectedSession && canvas.hiddenAgentIds.includes(selectedSession.sessionId)
@@ -521,108 +502,30 @@ function App() {
             openLoopId={openLoopId}
             setOpenLoopId={setOpenLoopId}
             requestWorkflowClose={() => workflowCloseRequestRef.current?.()}
-            onOpenProviderSetup={(sessionId) => {
-              setSelectedSessionId(sessionId);
-              setActiveTab('chat');
-              setShowRawEvents(false);
-              setProviderSetupSessionId(sessionId);
-            }}
+            onOpenProviderSetup={(sessionId) => navigation.openChat(sessionId, { providerSetup: true })}
           />
         )}
-        {!isSettingsPage && selectedSession && selectedSession.workspaceConnection?.kind !== 'ssh' && isWorkspacePanelOpen ? (
-          <div className="app-region-no-drag absolute inset-y-0 right-0 z-40 flex max-w-full shadow-2xl">
-            <SessionWorkspacePanel
-              sessionId={selectedSession.sessionId}
-              cwd={selectedSession.cwd}
-              runtimeApi={runtimeApi}
-              onClose={() => setIsWorkspacePanelOpen(false)}
-            />
-          </div>
-        ) : null}
-        {openPlanCouncil ? (
-          <div className="app-region-no-drag absolute bottom-0 right-0 top-11 z-40 w-[min(72vw,1080px)] min-w-[560px] max-w-full">
-            <PlanCouncilWorkbench
-              council={openPlanCouncil}
-              runtimeState={runtimeState}
-              runtimeApi={runtimeApi}
-              onStateChange={acceptRuntimeState}
-              onError={setRuntimeError}
-              onClose={() => setOpenPlanCouncilId(undefined)}
-              onOpenGraph={() => {
-                setOpenPlanCouncilId(undefined);
-                setActiveTab('chat');
-                setGraphCollapsed(false);
-              }}
-              onContinueDiscussion={
-                Object.values(runtimeState.collaborationSessions ?? {}).some((workspace) => workspace.councilIds.includes(openPlanCouncil.workflowId))
-                  ? (context) => {
-                      const workspace = Object.values(runtimeState.collaborationSessions ?? {}).find((item) =>
-                        item.councilIds.includes(openPlanCouncil.workflowId),
-                      );
-                      if (!workspace) return;
-                      setSelectedWorkspaceId(workspace.sessionId);
-                      setWorkspaceDraft({ workspaceId: workspace.sessionId, text: context });
-                      setActiveTab('workspace');
-                      setOpenPlanCouncilId(undefined);
-                    }
-                  : undefined
-              }
-              onOpenParticipant={(sessionId) => {
-                setSelectedSessionId(sessionId);
-                setActiveTab('chat');
-                setOpenPlanCouncilId(undefined);
-              }}
-            />
-          </div>
-        ) : null}
-        {isWorkflowLibraryOpen && !remoteWorkspaceSelected ? (
-          <div
-            className="app-region-no-drag absolute bottom-0 right-0 top-11 z-50 flex max-w-full shadow-2xl"
-            role="dialog"
-            aria-modal="true"
-            aria-label="New Workflow"
-            onKeyDown={(event) => {
-              if (event.key === 'Escape') {
-                event.preventDefault();
-                setIsWorkflowLibraryOpen(false);
-              }
-            }}
-          >
-            <TemplateLibraryPanel
-              runtimeApi={runtimeApi}
-              runtimeState={runtimeState}
-              onClose={() => setIsWorkflowLibraryOpen(false)}
-              onStateChange={acceptRuntimeState}
-              onError={setRuntimeError}
-              autoFocusClose
-              defaultCwd={localWorkflowCwd}
-              onWorkflowStarted={({ coderSessionId, loopId, notice }) => {
-                setSelectedSessionId(coderSessionId);
-                setActiveTab('chat');
-                setOpenLoopId(loopId);
-                setWorkflowNotice(notice ?? 'Coder started · Reviewer waiting');
-              }}
-              onPlanCouncilStarted={(result) => {
-                const coordinatorSessionId = result.council.coordinatorSessionId ?? result.synthesizerSessionId;
-                setSelectedSessionId(coordinatorSessionId);
-                setActiveTab('chat');
-                setOpenPlanCouncilId(result.workflowId);
-                setGraphCollapsed(false);
-                setWorkflowNotice('Plan Council started · independent plans are running');
-              }}
-              requestCloseRef={workflowCloseRequestRef}
-            />
-          </div>
-        ) : null}
-        {workflowNotice ? (
-          <button
-            type="button"
-            className="app-region-no-drag absolute bottom-4 left-1/2 z-[70] -translate-x-1/2 rounded-xl border border-lime-500/35 bg-background/95 px-4 py-2 font-mono text-[11px] text-lime-700 shadow-lg backdrop-blur dark:text-lime-300"
-            onClick={() => setWorkflowNotice(undefined)}
-          >
-            {workflowNotice}
-          </button>
-        ) : null}
+        <WorkspaceOverlays
+          navigation={navigation}
+          runtimeApi={runtimeApi}
+          runtimeState={runtimeState}
+          providerInstances={providerInstances}
+          selectedSession={selectedSession}
+          initialProviderInstanceId={selectedSession?.providerInstanceId ?? newChat.newProviderInstanceId}
+          isSettingsPage={isSettingsPage}
+          remoteWorkspaceSelected={remoteWorkspaceSelected}
+          localWorkflowCwd={localWorkflowCwd}
+          workflowCloseRequestRef={workflowCloseRequestRef}
+          acceptRuntimeState={acceptRuntimeState}
+          setRuntimeError={setRuntimeError}
+          onImported={(result) => {
+            acceptRuntimeState(result.state);
+            clearComposer();
+            actions.setPendingLinkedSourceId(null);
+            navigation.openChat(result.sessionId, { imported: true });
+            setSelectedCanvasNodeIds([result.sessionId]);
+          }}
+        />
       </main>
     </TooltipProvider>
   );

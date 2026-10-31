@@ -22,11 +22,12 @@ import { ComposerModelControls } from '@/components/composer-model-controls';
 import { ComposerPermissionControls } from '@/components/composer-permission-controls';
 import { ComposerAddMenu } from '@/components/composer-add-menu';
 import { type Dispatch, type ReactNode, type SetStateAction, useEffect, useMemo, useState } from 'react';
-import { type AgentSession, type ProviderSetupStatus } from '@/shared/graph-state';
+import { type AgentSession } from '@/shared/graph-state';
 import { type RuntimeCoreState } from '@/hooks/use-runtime-core';
 import { type LayoutPrefsState } from '@/hooks/use-layout-prefs';
 import { type ComposerState } from '@/hooks/use-composer';
-import { loadWorkspaceProviderSetupStatus, workspaceConnectionKey, type NewChatSetupState } from '@/hooks/use-new-chat-setup';
+import { type NewChatSetupState } from '@/hooks/use-new-chat-setup';
+import { useWorkspaceProviderSetup } from '@/hooks/use-workspace-provider-setup';
 import { useChatProjects } from '@/hooks/use-chat-projects';
 import type { SessionComposerSettingsState } from '@/hooks/use-session-composer-settings';
 import { type TerminalPanelState } from '@/hooks/use-terminal-panel';
@@ -172,13 +173,19 @@ export function ChatDetail({
       providerSetupSshHost && providerSetupSshRuntimePath ? { kind: 'ssh', host: providerSetupSshHost, runtimePath: providerSetupSshRuntimePath } : undefined,
     [providerSetupSshHost, providerSetupSshRuntimePath],
   );
-  const providerSetupWorkspaceKey = workspaceConnectionKey(providerSetupWorkspaceConnection);
   const providerSetupProfile = providerSetupProviderKind
     ? selectProviderSetupProfile(providerInstances, providerSetupProviderKind, providerSetupProviderInstanceId)
     : undefined;
   const providerSetupProfileKey = providerSetupProfileFingerprint(providerSetupProfile);
-  const [selectedProviderSetupStatus, setSelectedProviderSetupStatus] = useState<ProviderSetupStatus>();
-  const [isLoadingSelectedProviderSetup, setIsLoadingSelectedProviderSetup] = useState(false);
+  const { status: selectedProviderSetupStatus, loading: isLoadingSelectedProviderSetup } = useWorkspaceProviderSetup({
+    runtimeApi,
+    enabled: Boolean(providerSetupSession),
+    providerKind: providerSetupProviderKind ?? 'claude-code',
+    providerInstanceId: providerSetupProviderInstanceId ?? '',
+    profileFingerprint: providerSetupProfileKey,
+    cwd: providerSetupCwd ?? '',
+    connection: providerSetupWorkspaceConnection,
+  });
   const [projectDialogConnectionKind, setProjectDialogConnectionKind] = useState<'local' | 'ssh'>();
   const { createProjectWithDetails } = useChatProjects(runtimeApi, setRuntimeState);
 
@@ -192,57 +199,6 @@ export function ChatDetail({
     }
   }, [providerSetupSessionId, selectedSession?.sessionId, setProviderSetupSessionId]);
 
-  useEffect(() => {
-    if (!providerSetupProviderKind || !providerSetupProviderInstanceId || !runtimeApi) {
-      setSelectedProviderSetupStatus(undefined);
-      setIsLoadingSelectedProviderSetup(false);
-      return;
-    }
-    let cancelled = false;
-    setIsLoadingSelectedProviderSetup(true);
-    loadWorkspaceProviderSetupStatus({
-      runtimeApi,
-      connection: providerSetupWorkspaceConnection,
-      providerKind: providerSetupProviderKind,
-      providerInstanceId: providerSetupProviderInstanceId,
-      profileFingerprint: providerSetupProfileKey,
-      cwd: providerSetupCwd ?? '',
-    })
-      .then((status) => {
-        if (!cancelled) setSelectedProviderSetupStatus(status);
-      })
-      .catch((error: unknown) => {
-        if (cancelled) return;
-        setSelectedProviderSetupStatus({
-          providerKind: providerSetupProviderKind,
-          providerInstanceId: providerSetupProviderInstanceId,
-          generatedAt: new Date().toISOString(),
-          ...(providerSetupWorkspaceConnection?.kind === 'ssh' ? { readiness: 'unavailable' as const, auth: { status: 'unknown' as const } } : {}),
-          checks: [
-            {
-              id: providerSetupWorkspaceConnection?.kind === 'ssh' ? 'protocol' : 'setup-status',
-              label: 'Setup status',
-              status: 'error',
-              message: error instanceof Error ? error.message : String(error),
-            },
-          ],
-        });
-      })
-      .finally(() => {
-        if (!cancelled) setIsLoadingSelectedProviderSetup(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [
-    providerSetupCwd,
-    providerSetupProfileKey,
-    providerSetupProviderInstanceId,
-    providerSetupProviderKind,
-    providerSetupWorkspaceConnection,
-    providerSetupWorkspaceKey,
-    runtimeApi,
-  ]);
   const {
     isTerminalPanelOpen,
     isOpeningTerminal,

@@ -1,4 +1,3 @@
-import { workspaceMatchesSearch } from '@/lib/collaboration-display';
 import type { CollaborationSession } from '@shared/collaboration';
 import {
   Users,
@@ -22,14 +21,12 @@ import { Button } from '@/components/ui/button';
 import { Separator } from '@/components/ui/separator';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { cn } from '@/lib/utils';
-import { statusDotClassNames, sessionDisplayLabel, firstOpenRequests, lastMessagePreview } from '@/lib/session-display';
+import { statusDotClassNames, sessionDisplayLabel, lastMessagePreview } from '@/lib/session-display';
 import { defaultRailSidebarWidth, railSidebarMinWidth, railSidebarMaxWidth, type RailTab } from '@/lib/layout-prefs';
 import { formatRelativeTime, formatTimestamp, firstContentLine } from '@/lib/format';
-import { sessionRecoveryState } from '@/lib/diagnostics';
 import { RecoveryNotice } from '@/components/recovery';
-import { cloneElement, type Dispatch, type HTMLAttributes, type ReactElement, type SetStateAction, useEffect, useId, useRef, useState } from 'react';
-import { type AgentSession, type GraphState } from '@/shared/graph-state';
-import { type RuntimeRequest, type UserInputRequest } from '@/shared/provider-runtime';
+import { cloneElement, type Dispatch, type HTMLAttributes, type ReactElement, type SetStateAction, useEffect, useId, useRef } from 'react';
+import { type AgentSession } from '@/shared/graph-state';
 import { type RuntimeCoreState } from '@/hooks/use-runtime-core';
 import { type SessionListState } from '@/hooks/use-session-list';
 import { type SessionActionsState } from '@/hooks/use-session-actions';
@@ -43,28 +40,15 @@ import { ChatProjectSettingsDialog } from '@/components/chat-project-settings-di
 import { ChatProjectSectionDialog } from '@/components/chat-project-section-dialog';
 import { ChatContextMenu } from '@/components/chat-context-menu';
 import { ChatRenameDialog } from '@/components/chat-rename-dialog';
-import { groupChatsByProject, isChatInProject } from '@/lib/session-project-groups';
-import { useChatProjects } from '@/hooks/use-chat-projects';
+import { buildSidebarModel, type SessionEntry } from '@/lib/sidebar-model';
+import { SidebarChatRow } from '@/components/sidebar-chat-row';
+import { useSidebarManagement } from '@/hooks/use-sidebar-management';
 import { useChatProjectDrag } from '@/hooks/use-chat-project-drag';
 import { useProjectOrderDrag } from '@/hooks/use-project-order-drag';
 import { orderProjectGroups } from '@/lib/project-order';
 import type { LayoutPrefsState } from '@/hooks/use-layout-prefs';
-import { preferRuntimeSnapshot } from '../../shared/runtime-state-patch';
 
 const railTabs: { id: RailTab; label: string; icon: LucideIcon }[] = [{ id: 'orchestrate', label: 'Advanced', icon: Orbit }];
-
-const chatSectionsStorageKey = 'orrery.chatSections.v1';
-
-function initialChatSections() {
-  try {
-    const stored = JSON.parse(window.localStorage.getItem(chatSectionsStorageKey) ?? '{}');
-    const sections: Record<string, boolean> = {};
-    if (stored && typeof stored === 'object') for (const [key, value] of Object.entries(stored)) if (typeof value === 'boolean') sections[key] = value;
-    return { ...sections, projects: stored?.projects !== false, recents: stored?.recents !== false } as Record<string, boolean>;
-  } catch {
-    return { projects: true, recents: true } as Record<string, boolean>;
-  }
-}
 
 type SidebarRailProps = {
   core: RuntimeCoreState;
@@ -79,16 +63,7 @@ type SidebarRailProps = {
   onNewWorkspace: () => void;
   onOpenWorkspace: (id: string) => void;
   selectedWorkspaceId?: string;
-};
-
-type SessionTier = 'attention' | 'running' | 'recent';
-
-type SessionEntry = {
-  session: AgentSession;
-  recovery: ReturnType<typeof sessionRecoveryState>;
-  openRequests: RuntimeRequest[];
-  openInputs: UserInputRequest[];
-  tier: SessionTier;
+  onSelectSession: (sessionId: string) => void;
 };
 
 // "2m ago" reads fine in a card body but eats width in one-line rows.
@@ -119,19 +94,9 @@ export function SidebarRail({
   onNewWorkspace,
   onOpenWorkspace,
   selectedWorkspaceId,
+  onSelectSession,
 }: SidebarRailProps) {
-  const {
-    isRuntimeAvailable,
-    isElectron,
-    runtimeApi,
-    runtimeState,
-    setRuntimeState,
-    selectedSessionId,
-    selectedSession,
-    setSelectedSessionId,
-    sessions,
-    runtimeDiagnostics,
-  } = core;
+  const { isRuntimeAvailable, isElectron, runtimeApi, runtimeState, setRuntimeState, selectedSessionId, selectedSession, sessions } = core;
   const {
     sessionSearch,
     setSessionSearch,
@@ -141,41 +106,43 @@ export function SidebarRail({
     runningSessions,
     archivedSessionCount,
     filteredSessions,
+    entries,
     setSessionArchived,
     pinnedSessionIds,
     toggleSessionPinned,
   } = sessionList;
-  const [chatSections, setChatSections] = useState(initialChatSections);
-  const [projectDialog, setProjectDialog] = useState<{ sessionId?: string }>();
-  const [projectSettings, setProjectSettings] = useState<{ projectId: string; mode: 'edit' | 'connection' }>();
-  const [sectionDialog, setSectionDialog] = useState<{ sectionId?: string; projectId?: string }>();
-  const [renameTarget, setRenameTarget] = useState<{ sessionId: string; name: string }>();
-  const [projectError, setProjectError] = useState<string>();
-  const [archivingGroupChatIds, setArchivingGroupChatIds] = useState<Record<string, boolean>>({});
-  const groupArchiveInFlight = useRef(new Set<string>());
-  const projectsListId = useId();
-  const recentsListId = useId();
   const {
-    createProject,
-    moveChatToProject,
+    chatSections,
+    setChatSections,
+    projectDialog,
+    setProjectDialog,
+    projectSettings,
+    setProjectSettings,
+    sectionDialog,
+    setSectionDialog,
+    renameTarget,
+    setRenameTarget,
+    projectError,
+    archivingGroupChatIds,
     movingChatIds,
     pendingProjectIds,
-    updateProject,
+    moveChat,
+    archiveChat,
+    saveProjectDialog,
+    saveProjectSettings,
+    saveSectionDialog,
+    removeSectionDialog,
+    saveRename,
+    toggleProjectPinned,
     archiveProjectChats,
+    changeProjectSection,
     removeProject,
-    saveProjectSection,
-    removeProjectSection,
-  } = useChatProjects(runtimeApi, setRuntimeState);
+    openChatFolder,
+  } = useSidebarManagement({ runtimeApi, state: runtimeState, setRuntimeState, setSessionArchived });
+  const projectsListId = useId();
+  const recentsListId = useId();
   const pinButtonRefs = useRef(new Map<string, HTMLButtonElement>());
   const pendingPinFocusRef = useRef<string | undefined>(undefined);
-
-  useEffect(() => {
-    try {
-      window.localStorage.setItem(chatSectionsStorageKey, JSON.stringify(chatSections));
-    } catch {
-      // The view can still be switched when preference storage is unavailable.
-    }
-  }, [chatSections]);
 
   useEffect(() => {
     const sessionId = pendingPinFocusRef.current;
@@ -187,103 +154,35 @@ export function SidebarRail({
     button?.focus({ preventScroll: true });
   }, [pinnedSessionIds]);
 
-  const { setPendingLinkedSourceId, startNewChat, startProjectChat, startLinkedChat } = actions;
+  const { startNewChat, startProjectChat, startLinkedChat } = actions;
   const { respondToRuntimeRequest, pendingInteractionIds } = interactions;
   const archivedChatCount = archivedSessionCount + Object.values(runtimeState.collaborationSessions ?? {}).filter((workspace) => workspace.archived).length;
   const archiveVisibilityLabel = `${showArchivedSessions ? 'Hide' : 'Show'} archived chats (${archivedChatCount})`;
 
-  const selectSession = (sessionId: string) => {
-    setPendingLinkedSourceId(null);
-    setSelectedSessionId(sessionId);
-    setActiveTab('chat');
-  };
+  const selectSession = onSelectSession;
 
-  const pinnedIds = new Set(pinnedSessionIds);
-  const pinRanks = new Map(pinnedSessionIds.map((id, index) => [id, index]));
-  const workspaceEntries = Object.values(runtimeState.collaborationSessions ?? {})
-    .filter((workspace) => (showArchivedSessions || !workspace.archived) && workspaceMatchesSearch(workspace, sessionSearch))
-    .sort(
-      (a, b) =>
-        (pinRanks.get(a.sessionId) ?? Number.MAX_SAFE_INTEGER) - (pinRanks.get(b.sessionId) ?? Number.MAX_SAFE_INTEGER) ||
-        b.updatedAt.localeCompare(a.updatedAt),
-    );
-
-  const entries: SessionEntry[] = filteredSessions.map((session) => {
-    const node = runtimeState.nodes.find((candidate) => candidate.sessionId === session.sessionId);
-    const managedCluster = Object.values(runtimeState.clusters).find((cluster) => cluster.nodeIds.includes(session.sessionId));
-    const recovery = sessionRecoveryState({
-      session,
-      diagnostics: runtimeDiagnostics,
-      frozen: node?.frozen === true || managedCluster?.frozen === true,
-    });
-    const { openRequests, openInputs } = firstOpenRequests(session);
-    // Failed/killed sessions are terminal, not actionable — they get a rose or
-    // amber dot in Recent (their recovery notice still shows in the chat pane).
-    // Only recovery states beyond plain failure (invalid cwd, frozen, recovered
-    // runtime) pin a session to the attention tier.
-    const actionableRecovery = recovery && session.status !== 'failed' && session.status !== 'killed' ? recovery : undefined;
-    const tier: SessionTier =
-      openRequests.length > 0 || openInputs.length > 0 || actionableRecovery
-        ? 'attention'
-        : session.status === 'running' || session.status === 'pending'
-          ? 'running'
-          : 'recent';
-    return { session, recovery: actionableRecovery, openRequests, openInputs, tier };
-  });
-
-  const entryById = new Map(entries.map((entry) => [entry.session.sessionId, entry]));
-  const workspaceById = new Map(workspaceEntries.map((workspace) => [workspace.sessionId, workspace]));
-  const chatProjects = runtimeState.chatProjects ?? {};
-  const projectSections = Object.values(runtimeState.chatProjectSections ?? {}).sort((left, right) => left.createdAt.localeCompare(right.createdAt));
-  const projectOptions = Object.values(chatProjects).sort((left, right) => left.label.localeCompare(right.label));
-  const visiblePinnedIds = pinnedSessionIds.filter((id) => {
-    const chat = entryById.get(id)?.session ?? workspaceById.get(id);
-    return chat && !isChatInProject(chat, chatProjects);
-  });
-  const unassignedEntries = entries.filter((entry) => !isChatInProject(entry.session, chatProjects));
-  const unassignedWorkspaces = workspaceEntries.filter((workspace) => !isChatInProject(workspace, chatProjects));
-  const unpinnedWorkspaces = unassignedWorkspaces.filter((workspace) => !pinnedIds.has(workspace.sessionId));
-  const attentionEntries = unassignedEntries.filter((entry) => entry.tier === 'attention' && !pinnedIds.has(entry.session.sessionId));
-  const runningEntries = unassignedEntries.filter((entry) => entry.tier === 'running' && !pinnedIds.has(entry.session.sessionId));
-  const recentEntries = unassignedEntries.filter((entry) => entry.tier === 'recent' && !pinnedIds.has(entry.session.sessionId));
-  const sidebarChats = [...filteredSessions, ...workspaceEntries].sort(
-    (left, right) =>
-      (pinRanks.get(left.sessionId) ?? Number.MAX_SAFE_INTEGER) - (pinRanks.get(right.sessionId) ?? Number.MAX_SAFE_INTEGER) ||
-      right.updatedAt.localeCompare(left.updatedAt),
-  );
-  const baseProjectGroups = groupChatsByProject<AgentSession | CollaborationSession>(sidebarChats, chatProjects).sort(
-    (left, right) => Number(Boolean(chatProjects[right.key]?.pinned)) - Number(Boolean(chatProjects[left.key]?.pinned)),
-  );
+  const {
+    pinnedIds,
+    workspaceEntries,
+    entryById,
+    workspaceById,
+    chatProjects,
+    projectSections,
+    projectOptions,
+    visiblePinnedIds,
+    unassignedEntries,
+    unassignedWorkspaces,
+    unpinnedWorkspaces,
+    baseProjectGroups,
+    attentionEntries,
+    runningEntries,
+    recentEntries,
+    projectSectionViews,
+  } = buildSidebarModel({ state: runtimeState, entries, pinnedSessionIds, showArchivedSessions, sessionSearch });
   const projectDrag = useProjectOrderDrag({ projects: chatProjects, projectIds: baseProjectGroups.map((group) => group.key) });
   const projectGroups = orderProjectGroups(baseProjectGroups, projectDrag.projectOrder).sort(
     (left, right) => Number(Boolean(chatProjects[right.key]?.pinned)) - Number(Boolean(chatProjects[left.key]?.pinned)),
   );
-  const projectSectionViews = [
-    { key: 'projects', label: 'Projects', sectionId: undefined as string | undefined },
-    ...projectSections.map((section) => ({ key: `project-section:${section.sectionId}`, label: section.label, sectionId: section.sectionId })),
-  ];
-  const runProjectAction = async (action: () => Promise<unknown>) => {
-    setProjectError(undefined);
-    try {
-      await action();
-    } catch (cause) {
-      setProjectError(cause instanceof Error ? cause.message : String(cause));
-    }
-  };
-
-  const moveChat = async (sessionId: string, projectId: string | null) => {
-    setProjectError(undefined);
-    try {
-      await moveChatToProject(sessionId, projectId);
-      const sectionId = projectId ? chatProjects[projectId]?.sectionId : undefined;
-      setChatSections((current) => ({ ...current, [projectId ? (sectionId ? `project-section:${sectionId}` : 'projects') : 'recents']: true }));
-      return true;
-    } catch (cause) {
-      setProjectError(cause instanceof Error ? cause.message : String(cause));
-      return false;
-    }
-  };
-
   const chatDrag = useChatProjectDrag({
     state: runtimeState,
     available: isRuntimeAvailable,
@@ -297,34 +196,7 @@ export function SidebarRail({
     if (chatDrag.hoveredTarget !== null || chatSections.recents !== false) return;
     const timer = window.setTimeout(() => setChatSections((current) => ({ ...current, recents: true })), 500);
     return () => window.clearTimeout(timer);
-  }, [chatDrag.hoveredTarget, chatSections.recents]);
-
-  const archiveChat = async (chat: AgentSession | CollaborationSession) => {
-    if ('status' in chat) {
-      await setSessionArchived(chat.sessionId, !chat.archived);
-      return;
-    }
-    if (!runtimeApi || groupArchiveInFlight.current.has(chat.sessionId)) return;
-    groupArchiveInFlight.current.add(chat.sessionId);
-    setArchivingGroupChatIds((current) => ({ ...current, [chat.sessionId]: true }));
-    setProjectError(undefined);
-    try {
-      const result = await runtimeApi.dispatchCommand({
-        kind: 'archive_collaboration_session',
-        input: { sessionId: chat.sessionId, archived: !chat.archived },
-      });
-      setRuntimeState((result.state as GraphState | undefined) ?? (await runtimeApi.getState()));
-    } catch (cause) {
-      setProjectError(cause instanceof Error ? cause.message : String(cause));
-    } finally {
-      groupArchiveInFlight.current.delete(chat.sessionId);
-      setArchivingGroupChatIds((current) => {
-        const next = { ...current };
-        delete next[chat.sessionId];
-        return next;
-      });
-    }
-  };
+  }, [chatDrag.hoveredTarget, chatSections.recents, setChatSections]);
 
   const renderChatContextMenu = (chat: AgentSession | CollaborationSession, children: ReactElement) => {
     const row = children as ReactElement<HTMLAttributes<HTMLElement>>;
@@ -363,16 +235,7 @@ export function SidebarRail({
         }}
         onMove={(projectId) => void moveChat(chat.sessionId, projectId)}
         onNewProject={() => setProjectDialog({ sessionId: chat.sessionId })}
-        onOpenFolder={
-          runtimeApi && chat.cwd.trim()
-            ? () => {
-                setProjectError(undefined);
-                void runtimeApi
-                  .openWorkspace({ cwd: chat.cwd, target: 'finder' })
-                  .catch((cause) => setProjectError(cause instanceof Error ? cause.message : String(cause)));
-              }
-            : undefined
-        }
+        onOpenFolder={runtimeApi && chat.cwd.trim() ? () => void openChatFolder(chat.cwd) : undefined}
         onArchive={() => void archiveChat(chat)}
       >
         {cloneElement(row, dragRowProps)}
@@ -448,24 +311,17 @@ export function SidebarRail({
 
     const toneBg = !request && input ? 'bg-term-cyan/[0.06] hover:bg-term-cyan/10' : 'bg-term-amber/[0.06] hover:bg-term-amber/10';
 
-    return renderChatContextMenu(
-      session,
-      <div
-        role="button"
-        tabIndex={0}
+    return (
+      <SidebarChatRow
+        key={session.sessionId}
+        chat={session}
+        renderContextMenu={renderChatContextMenu}
+        onSelect={() => selectSession(session.sessionId)}
         className={cn(
           'group/chat cursor-pointer rounded-lg p-2.5 font-mono transition focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring/70',
           isSel ? 'bg-term-accent-hi/10' : toneBg,
           session.archived && 'opacity-60',
         )}
-        onClick={() => selectSession(session.sessionId)}
-        onKeyDown={(event) => {
-          if (event.target !== event.currentTarget) return;
-          if (event.key === 'Enter' || event.key === ' ') {
-            event.preventDefault();
-            selectSession(session.sessionId);
-          }
-        }}
       >
         <div className="flex items-center gap-2">
           <span className={cn('size-1.5 shrink-0 rounded-full', !request && input ? 'bg-term-cyan' : 'bg-term-amber')} />
@@ -523,7 +379,7 @@ export function SidebarRail({
             <RecoveryNotice state={recovery} compact />
           </div>
         ) : null}
-      </div>,
+      </SidebarChatRow>
     );
   };
 
@@ -531,23 +387,16 @@ export function SidebarRail({
     const { session } = entry;
     const isSel = selectedSessionId === session.sessionId;
     const isPendingStart = session.status === 'pending';
-    return renderChatContextMenu(
-      session,
-      <div
-        role="button"
-        tabIndex={0}
+    return (
+      <SidebarChatRow
+        key={session.sessionId}
+        chat={session}
+        renderContextMenu={renderChatContextMenu}
+        onSelect={() => selectSession(session.sessionId)}
         className={cn(
           'group/chat cursor-pointer rounded-lg p-2.5 font-mono transition focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring/70',
           isSel ? 'bg-term-accent-hi/10' : 'hover:bg-foreground/[0.045]',
         )}
-        onClick={() => selectSession(session.sessionId)}
-        onKeyDown={(event) => {
-          if (event.target !== event.currentTarget) return;
-          if (event.key === 'Enter' || event.key === ' ') {
-            event.preventDefault();
-            selectSession(session.sessionId);
-          }
-        }}
       >
         <div className="flex items-center gap-2">
           <span className={cn('size-1.5 shrink-0 animate-pulse rounded-full', isPendingStart ? 'bg-term-amber' : 'bg-term-green')} />
@@ -571,31 +420,24 @@ export function SidebarRail({
             )}
           />
         </div>
-      </div>,
+      </SidebarChatRow>
     );
   };
 
   const renderRecentRow = (entry: SessionEntry) => {
     const { session } = entry;
     const isSel = selectedSessionId === session.sessionId;
-    return renderChatContextMenu(
-      session,
-      <div
-        role="button"
-        tabIndex={0}
+    return (
+      <SidebarChatRow
+        key={session.sessionId}
+        chat={session}
+        renderContextMenu={renderChatContextMenu}
+        onSelect={() => selectSession(session.sessionId)}
         className={cn(
           'group/chat flex cursor-pointer items-center gap-2 rounded-md px-2 py-[5px] font-mono transition data-[state=open]:bg-foreground/[0.045] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring/70',
           isSel ? 'bg-term-accent-hi/10' : 'hover:bg-foreground/[0.045]',
           session.archived && 'opacity-60',
         )}
-        onClick={() => selectSession(session.sessionId)}
-        onKeyDown={(event) => {
-          if (event.target !== event.currentTarget) return;
-          if (event.key === 'Enter' || event.key === ' ') {
-            event.preventDefault();
-            selectSession(session.sessionId);
-          }
-        }}
       >
         {session.role === 'master' ? (
           <span className="w-1.5 shrink-0 text-center text-[7px] leading-none text-term-amber">◆</span>
@@ -612,27 +454,19 @@ export function SidebarRail({
         </span>
         {renderPinButton(session.sessionId)}
         {renderArchiveButton(session, '-my-1 -mr-1 hidden group-hover/chat:block group-focus-within/chat:block group-hover/chat:opacity-100')}
-      </div>,
+      </SidebarChatRow>
     );
   };
 
   const renderWorkspaceCard = (workspace: CollaborationSession) => {
     const discussion = workspace.activeDiscussionId ? workspace.discussions[workspace.activeDiscussionId] : undefined;
     const attention = workspace.members.some((member) => member.attention);
-    return renderChatContextMenu(
-      workspace,
-      <div
+    return (
+      <SidebarChatRow
         key={workspace.sessionId}
-        role="button"
-        tabIndex={0}
-        onClick={() => onOpenWorkspace(workspace.sessionId)}
-        onKeyDown={(event) => {
-          if (event.target !== event.currentTarget) return;
-          if (event.key === 'Enter' || event.key === ' ') {
-            event.preventDefault();
-            onOpenWorkspace(workspace.sessionId);
-          }
-        }}
+        chat={workspace}
+        renderContextMenu={renderChatContextMenu}
+        onSelect={() => onOpenWorkspace(workspace.sessionId)}
         className={cn(
           'group/chat w-full cursor-pointer rounded-lg p-3 text-left transition focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring/70',
           activeTab === 'workspace' && selectedWorkspaceId === workspace.sessionId ? 'bg-accent-ink/10' : 'hover:bg-accent',
@@ -649,7 +483,7 @@ export function SidebarRail({
           {workspace.archived ? 'Archived' : attention ? 'Needs attention' : discussion ? `Together · ${discussion.status}` : 'Group chat'} ·{' '}
           {compactTime(workspace.updatedAt)}
         </span>
-      </div>,
+      </SidebarChatRow>
     );
   };
 
@@ -859,23 +693,13 @@ export function SidebarRail({
                       reorderPlacement={projectDrag.hoveredTarget?.projectId === group.key ? projectDrag.hoveredTarget.placement : undefined}
                       isReordering={projectDrag.draggedProjectId === group.key}
                       onNewChat={isRuntimeAvailable ? () => startProjectChat(group.key) : undefined}
-                      onTogglePin={() => void runProjectAction(() => updateProject(group.key, { pinned: !project.pinned }))}
+                      onTogglePin={() => void toggleProjectPinned(group.key)}
                       onEdit={() => setProjectSettings({ projectId: group.key, mode: 'edit' })}
                       onConnection={() => setProjectSettings({ projectId: group.key, mode: 'connection' })}
-                      onSection={(sectionId) =>
-                        void runProjectAction(async () => {
-                          await updateProject(group.key, { sectionId });
-                          setChatSections((current) => ({ ...current, [sectionId ? `project-section:${sectionId}` : 'projects']: true }));
-                        })
-                      }
+                      onSection={(sectionId) => void changeProjectSection(group.key, sectionId)}
                       onNewSection={() => setSectionDialog({ projectId: group.key })}
-                      onArchive={() => void runProjectAction(() => archiveProjectChats(group.key))}
-                      onRemove={() =>
-                        void runProjectAction(async () => {
-                          await removeProject(group.key);
-                          setChatSections((current) => ({ ...current, recents: true }));
-                        })
-                      }
+                      onArchive={() => void archiveProjectChats(group.key)}
+                      onRemove={() => void removeProject(group.key)}
                     >
                       {group.chats.map((chat) => {
                         const entry = entryById.get(chat.sessionId);
@@ -993,10 +817,7 @@ export function SidebarRail({
           mode={projectSettings.mode}
           runtimeApi={runtimeApi}
           onClose={() => setProjectSettings(undefined)}
-          onSave={async (patch) => {
-            await updateProject(projectSettings.projectId, patch);
-            setProjectSettings(undefined);
-          }}
+          onSave={saveProjectSettings}
         />
       ) : null}
       {sectionDialog ? (
@@ -1004,49 +825,19 @@ export function SidebarRail({
           key={sectionDialog.sectionId ?? 'new'}
           section={sectionDialog.sectionId ? runtimeState.chatProjectSections?.[sectionDialog.sectionId] : undefined}
           onClose={() => setSectionDialog(undefined)}
-          onSave={async (label) => {
-            const sectionId = await saveProjectSection(label, sectionDialog.sectionId);
-            if (sectionDialog.projectId) await updateProject(sectionDialog.projectId, { sectionId });
-            setChatSections((current) => ({ ...current, [`project-section:${sectionId}`]: true }));
-            setSectionDialog(undefined);
-          }}
-          onRemove={
-            sectionDialog.sectionId
-              ? async () => {
-                  await removeProjectSection(sectionDialog.sectionId!);
-                  setChatSections((current) => ({ ...current, projects: true }));
-                  setSectionDialog(undefined);
-                }
-              : undefined
-          }
+          onSave={saveSectionDialog}
+          onRemove={sectionDialog.sectionId ? removeSectionDialog : undefined}
         />
       ) : null}
       {renameTarget ? (
-        <ChatRenameDialog
-          key={renameTarget.sessionId}
-          initialName={renameTarget.name}
-          onClose={() => setRenameTarget(undefined)}
-          onSave={async (label) => {
-            if (!runtimeApi) throw new Error('Start the runtime before renaming a chat.');
-            const result = await runtimeApi.dispatchCommand({ kind: 'rename_chat', input: { sessionId: renameTarget.sessionId, label } });
-            const state = (result.state as GraphState | undefined) ?? (await runtimeApi.getState());
-            setRuntimeState((current) => preferRuntimeSnapshot(current, state) as GraphState);
-            setRenameTarget(undefined);
-          }}
-        />
+        <ChatRenameDialog key={renameTarget.sessionId} initialName={renameTarget.name} onClose={() => setRenameTarget(undefined)} onSave={saveRename} />
       ) : null}
       {projectDialog ? (
         <ChatProjectDialog
           runtimeApi={runtimeApi}
           movingChat={Boolean(projectDialog.sessionId)}
           onClose={() => setProjectDialog(undefined)}
-          onSave={async (cwd, label, connection) => {
-            const projectId = await createProject(cwd, label, connection);
-            if (projectDialog.sessionId) await moveChatToProject(projectDialog.sessionId, projectId);
-            setChatSections((current) => ({ ...current, projects: true }));
-            setProjectDialog(undefined);
-            setProjectError(undefined);
-          }}
+          onSave={saveProjectDialog}
         />
       ) : null}
       <footer className="app-region-no-drag flex shrink-0 items-center gap-3 border-t border-border px-2 py-1.5 font-mono text-[11px] tracking-[0.02em] text-muted-foreground">

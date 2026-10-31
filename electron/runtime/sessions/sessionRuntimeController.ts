@@ -3,7 +3,8 @@
 // and worktree merge/cleanup. Durable mutations still commit through the
 // manager-owned CommandExecutor via the explicit host port below.
 import { execFileSync } from 'node:child_process'
-import { createHash, randomUUID } from 'node:crypto'
+import { randomUUID } from 'node:crypto'
+import { EventEmitter } from 'node:events'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -42,22 +43,24 @@ import {
 } from '../runtimeCommon.js'
 import {
   type CheckpointHost,
-  captureTurnCheckpoint,
   checkpointDiffForSession,
   completedTurnCount,
-  pruneTurnCheckpointRefs,
+  pruneTurnCheckpointRefsAsync,
   recordTurnCheckpointDiff,
 } from '../workspace/sessionCheckpoints.js'
 import { gitOutput } from '../workspace/gitWorkspace.js'
+import { GitCheckpointService } from '../workspace/gitCheckpointService.js'
 import { bindSessionWorkspaceConnection, workspaceTransitionPrompt } from './workspaceConnectionState.js'
 import { workspaceConnectionKey } from '../workspace/remoteWorkspace.js'
+import type { RunResource, RuntimeRunContext } from './runtimeRunContext.js'
 
 function createLifecycleAbortSignal() {
   let resolve!: () => void
+  const controller = new AbortController()
   const promise = new Promise<void>((settle) => {
-    resolve = settle
+    resolve = () => { controller.abort(); settle() }
   })
-  return { promise, resolve }
+  return { promise, resolve, signal: controller.signal }
 }
 
 export type RuntimeRun = JsonRecord & {
@@ -67,17 +70,31 @@ export type RuntimeRun = JsonRecord & {
   answerUserInput?: (input: JsonRecord) => JsonRecord | void | Promise<JsonRecord | void>
 }
 
+/** A launch owns its lease before Git/bridge startup, and remains stoppable. */
+class PendingProviderRun extends EventEmitter {
+  readonly pendingLaunch = true
+  #cancellation: AbortController
+  #finished = false
+  constructor(cancellation: AbortController) { super(); this.#cancellation = cancellation }
+  finish() { this.#finished = true }
+  kill() {
+    if (this.#finished || this.#cancellation.signal.aborted) return false
+    this.#cancellation.abort()
+    return true
+  }
+}
+
 export type SessionRuntimeHost = {
   state(): JsonRecord
   runs(): Map<string, RuntimeRun>
-  runContext(): Map<string, JsonRecord>
+  runContext(): Map<string, RuntimeRunContext>
   workflowCompensatedRuns(): Set<string>
   bridge(): MembraneBridge
   providerService(): ProviderService
   channelStore(): ContextChannelStore
   queries(): RuntimeQueries
   checkpointHost(): CheckpointHost
-  dispatchCommand(command: JsonRecord): Promise<any>
+  dispatchCommand(command: JsonRecord, options?: { reviveAutonomousDrains?: boolean }): Promise<any>
   appendKernelEvent(type: string, payload: JsonRecord, ctx: JsonRecord, options?: JsonRecord): any
   touch(): void
   touchDeferred(): void
@@ -91,6 +108,9 @@ export type SessionRuntimeHost = {
   planCouncilFailed(sessionId: string, error: string): void
   journalAutomaticDeploymentRunStarted(sessionId: string): void
   commandLifecycleEpoch(): number | undefined
+  controlTransactionActive(): boolean
+  deferProviderLaunchUntilCommit(): boolean
+  stagePostCommitEffect(effect: { label: string; run: () => void }): void
 }
 
 export class SessionRuntimeController {
@@ -100,6 +120,24 @@ export class SessionRuntimeController {
   #runQueueLifecycleEpoch = 0
   #runQueueLaunchAbort = createLifecycleAbortSignal()
   #runBudgetTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  #checkpoints = new GitCheckpointService()
+  #workspaceOperations = new Set<Promise<unknown>>()
+
+  private trackWorkspaceOperation<T>(operation: Promise<T>): Promise<T> {
+    this.#workspaceOperations.add(operation)
+    const clean = () => { this.#workspaceOperations.delete(operation) }
+    void operation.then(clean, clean)
+    return operation
+  }
+
+  hasPendingWorkspaceOperations() {
+    return this.#workspaceOperations.size > 0
+  }
+
+  async flushWorkspaceOperations() {
+    while (this.#workspaceOperations.size) await Promise.allSettled([...this.#workspaceOperations])
+    await this.#checkpoints.idle()
+  }
 
   constructor(host: SessionRuntimeHost) {
     this.#host = host
@@ -132,8 +170,8 @@ export class SessionRuntimeController {
   private checkpointHost() {
     return this.#host.checkpointHost()
   }
-  private dispatchCommand(command: JsonRecord) {
-    return this.#host.dispatchCommand(command)
+  private dispatchCommand(command: JsonRecord, options?: { reviveAutonomousDrains?: boolean }) {
+    return this.#host.dispatchCommand(command, options)
   }
   private appendKernelEvent(
     type: string,
@@ -182,6 +220,10 @@ export class SessionRuntimeController {
 
   lifecycleEpoch() {
     return this.#runQueueLifecycleEpoch
+  }
+
+  isQueueDrainEnabled() {
+    return this.#runQueueDrainEnabled
   }
 
   resumeQueueDrain(expectedLifecycleEpoch?: number) {
@@ -242,7 +284,7 @@ export class SessionRuntimeController {
     }
   }
 
-  private runResource(sessionId, turnId) {
+  private runResource(sessionId: string, turnId: string): RunResource {
     const session = this.state.sessions[sessionId]
     const scopeId = this.resourceScopeId(sessionId)
     const remote = session?.workspaceConnection?.kind === 'ssh'
@@ -272,10 +314,15 @@ export class SessionRuntimeController {
     }
   }
 
-  private admissionReason(resource) {
+  private admissionReason(resource, includeCommitReservations = false) {
     const policy = this.resourcePolicy(resource.scopeId)
     const globalPolicy = this.resourcePolicy('global')
-    const active = (this.state.workspaceLeases ?? []).filter((lease) => lease.status === 'active')
+    const active = [
+      ...(this.state.workspaceLeases ?? []).filter((lease) => lease.status === 'active'),
+      ...(includeCommitReservations ? (this.state.runQueue ?? [])
+        .filter((item) => item.reason === 'command-commit')
+        .map((item) => ({ ...item, mode: item.leaseMode, status: 'active' })) : []),
+    ]
     if (
       active.filter((lease) => lease.scopeId === resource.scopeId).length >=
       policy.maxConcurrentSessions
@@ -413,7 +460,10 @@ export class SessionRuntimeController {
     if (exceeded) {
       throw this.freezeForBudget(sessionId, exceeded)
     }
-    const reason = this.admissionReason(resource)
+    // Ordinary chat commands commit their durable launch request before slow
+    // setup, freeing the command channel for an authorized stop. Compound
+    // workflows keep their existing atomic startup/compensation contract.
+    const reason = this.admissionReason(resource, this.#host.deferProviderLaunchUntilCommit()) ?? (this.#host.deferProviderLaunchUntilCommit() ? 'command-commit' : undefined)
     if (!reason)
       return this.launchRun(
         sessionId,
@@ -423,7 +473,8 @@ export class SessionRuntimeController {
         allowWhileQueueSuspended,
       )
     if (
-      (this.state.runQueue ?? []).filter((item) => item.scopeId === resource.scopeId).length >=
+      reason !== 'command-commit' &&
+      (this.state.runQueue ?? []).filter((item) => item.scopeId === resource.scopeId && item.reason !== 'command-commit').length >=
       policy.maxQueuedRuns
     ) {
       this.state.schedulerMetrics.rejectedTotal += 1
@@ -463,6 +514,10 @@ export class SessionRuntimeController {
       { actor: { kind: 'runtime' } },
     )
     this.touch()
+    if (reason === 'command-commit') this.#host.stagePostCommitEffect({
+      label: `provider-launch:${sessionId}:${runId}`,
+      run: () => { void this.drainRunQueue() },
+    })
     return runId
   }
 
@@ -478,7 +533,7 @@ export class SessionRuntimeController {
   }
 
   async drainRunQueue() {
-    if (this.#runQueueDrainInFlight || !this.#runQueueDrainEnabled) return
+    if (this.#runQueueDrainInFlight || !this.#runQueueDrainEnabled || !this.state.runQueue?.length) return
     this.#runQueueDrainInFlight = true
     try {
       while (this.#runQueueDrainEnabled && this.state.runQueue?.length) {
@@ -514,7 +569,7 @@ export class SessionRuntimeController {
             candidate,
           )
         } catch (error) {
-          if (this.state.sessions[candidate.sessionId]?.status !== 'failed') {
+          if (!['failed', 'killed'].includes(this.state.sessions[candidate.sessionId]?.status)) {
             this.failSession(
               candidate.sessionId,
               error instanceof Error ? error.message : String(error),
@@ -528,7 +583,11 @@ export class SessionRuntimeController {
     }
   }
 
-  private async launchRun(
+  private launchRun(...args: Parameters<SessionRuntimeController['launchRunNow']>) {
+    return this.trackWorkspaceOperation(this.launchRunNow(...args))
+  }
+
+  private async launchRunNow(
     sessionId,
     {
       prompt,
@@ -565,16 +624,44 @@ export class SessionRuntimeController {
       acquiredAt: now(),
       baseline: {},
     }
-    try {
-      if (session.workspaceConnection?.kind === 'ssh') throw new Error('Remote workspaces do not use local Git baselines.')
-      lease.baseline.head = gitOutput(session.cwd, ['rev-parse', 'HEAD'])
-      lease.baseline.statusDigest = createHash('sha256')
-        .update(gitOutput(session.cwd, ['status', '--porcelain=v1']))
-        .digest('hex')
-    } catch {
-      /* non-git workspaces still receive mutual exclusion */
-    }
     this.state.workspaceLeases.push(lease)
+    const cancellation = new AbortController()
+    const launchSignal = AbortSignal.any([cancellation.signal, this.#runQueueLaunchAbort.signal])
+    const pendingRun = new PendingProviderRun(cancellation)
+    this.runs.set(sessionId, pendingRun)
+    this.runContext.set(sessionId, { runId, runKind, activationEventId, channelReadSeqs, runProducedOutput: false })
+    const cancelledLaunch = (error: unknown) => {
+      if (this.runs.get(sessionId) === pendingRun) this.runs.delete(sessionId)
+      const context = this.runContext.get(sessionId)
+      const killed = session.status === 'killed' || context?.killRequested
+      this.releaseWorkspaceLease(runId, 'runtime-shutdown')
+      if (context?.runProducedOutput === false && context.channelReadSeqs?.length) {
+        this.channelStore.unmarkRead(sessionId, context.channelReadSeqs)
+      }
+      this.runContext.delete(sessionId)
+      if (session.workspaceConnection?.kind !== 'ssh') {
+        void this.trackWorkspaceOperation(pruneTurnCheckpointRefsAsync(this.checkpointHost(), sessionId, this.#checkpoints))
+      }
+      if (killed) {
+        this.touch()
+        this.emitRuntimeEvent({ type: 'session.killed', sessionId, state: this.getState(), kernelEventId: context?.killedEventId })
+      } else this.failSession(sessionId, error instanceof Error ? error.message : String(error), {
+        actor: { kind: 'runtime' }, causeId: activationEventId,
+        ...(runExecution ? { execution: clone(runExecution) } : {}),
+      })
+    }
+    try {
+      if (session.workspaceConnection?.kind !== 'ssh') {
+        lease.baseline = await this.trackWorkspaceOperation(this.#checkpoints.baseline(session.cwd, launchSignal))
+      }
+      launchSignal.throwIfAborted()
+    } catch (error) {
+      const failure = launchSignal.aborted
+        ? new Error(launchLifecycleEpoch !== this.#runQueueLifecycleEpoch ? 'Provider run launch was cancelled by runtime shutdown.' : 'Provider run launch was cancelled.')
+        : error
+      cancelledLaunch(failure)
+      throw failure
+    }
     let bridgeResult:
       | { status: 'started'; bridgeUrl: string }
       | { status: 'aborted' }
@@ -584,23 +671,23 @@ export class SessionRuntimeController {
           .start()
           .then((bridgeUrl) => ({ status: 'started' as const, bridgeUrl })),
         launchAbort.then(() => ({ status: 'aborted' as const })),
+        new Promise<{ status: 'aborted' }>((resolve) => {
+          if (launchSignal.aborted) resolve({ status: 'aborted' })
+          else launchSignal.addEventListener('abort', () => resolve({ status: 'aborted' }), { once: true })
+        }),
       ])
     } catch (error) {
-      this.releaseWorkspaceLease(runId, 'membrane-start-failed')
+      cancelledLaunch(error)
       throw error
     }
     if (
+      launchSignal.aborted ||
       bridgeResult.status === 'aborted' ||
       launchLifecycleEpoch !== this.#runQueueLifecycleEpoch ||
       (!this.#runQueueDrainEnabled && !allowWhileQueueSuspended)
     ) {
       const error = new Error('Provider run launch was cancelled by runtime shutdown.')
-      this.releaseWorkspaceLease(runId, 'runtime-shutdown')
-      this.failSession(sessionId, error.message, {
-        actor: { kind: 'runtime' },
-        causeId: activationEventId,
-        ...(runExecution ? { execution: clone(runExecution) } : {}),
-      })
+      cancelledLaunch(error)
       throw error
     }
     const bridgeUrl = bridgeResult.bridgeUrl
@@ -612,13 +699,11 @@ export class SessionRuntimeController {
     session.finishedAt = undefined
     session.updatedAt = session.startedAt
     try {
+      if (session.workspaceConnection?.kind === 'ssh') throw new Error('Local Git checkpoints are unavailable for SSH workspaces.')
       turnCheckpoint = {
-        ...captureTurnCheckpoint(this.checkpointHost(), {
-          sessionId,
-          turnId: runId,
-          turnCount: fromTurnCount,
-          stage: 'before',
-        }),
+        ...await this.trackWorkspaceOperation(this.#checkpoints.capture({
+          cwd: session.cwd, sessionId, turnId: runId, turnCount: fromTurnCount, stage: 'before',
+        }, launchSignal)),
         fromTurnCount,
       }
     } catch (error) {
@@ -626,6 +711,11 @@ export class SessionRuntimeController {
         fromTurnCount,
         error: error instanceof Error ? error.message : String(error),
       }
+    }
+    if (launchSignal.aborted || launchLifecycleEpoch !== this.#runQueueLifecycleEpoch) {
+      const error = new Error('Provider run launch was cancelled before its checkpoint finished.')
+      cancelledLaunch(error)
+      throw error
     }
     this.updateMessageRunId(session, userMessageId, runId)
     this.updateNodeStatus(sessionId, 'running')
@@ -707,11 +797,15 @@ export class SessionRuntimeController {
       })
     } catch (error) {
       this.bridge.revokeRunToken(membraneToken)
-      this.releaseWorkspaceLease(runId, 'provider-start-failed')
+      pendingRun.finish()
       this.failSession(sessionId, error.message)
+      await this.runContext.get(sessionId)?.failureFinalization
+      if (this.runs.get(sessionId) === pendingRun) this.runs.delete(sessionId)
+      this.releaseWorkspaceLease(runId, 'provider-start-failed')
       throw error
     }
 
+    pendingRun.finish()
     this.runs.set(sessionId, run)
     this.scheduleRunDurationBudgetTimer(sessionId)
 
@@ -734,120 +828,154 @@ export class SessionRuntimeController {
       if (this.workflowCompensatedRuns.has(sessionId)) return
       const current = this.state.sessions[sessionId]
       const context = this.runContext.get(sessionId)
-      if (current?.status === 'killed' || context?.killRequested === true) {
+      if (current?.status === 'killed' || current?.status === 'failed' || context?.killRequested === true || context?.closeStarted === true) {
         return
       }
       this.failSession(sessionId, error.message)
     })
     run.on('close', ({ code, signal, killed }) => {
-      this.runs.delete(sessionId)
-      const budgetTimer = this.#runBudgetTimers.get(sessionId)
-      if (budgetTimer) clearTimeout(budgetTimer)
-      this.#runBudgetTimers.delete(sessionId)
-      this.bridge.revokeRunToken(membraneToken)
+      void this.trackWorkspaceOperation((async () => {
+        const budgetTimer = this.#runBudgetTimers.get(sessionId)
+        if (budgetTimer) clearTimeout(budgetTimer)
+        this.#runBudgetTimers.delete(sessionId)
+        this.bridge.revokeRunToken(membraneToken)
 
-      if (this.workflowCompensatedRuns.delete(sessionId)) return
+        if (this.workflowCompensatedRuns.delete(sessionId)) {
+          if (this.runs.get(sessionId) === run) this.runs.delete(sessionId)
+          return
+        }
 
-      const current = this.state.sessions[sessionId]
-      if (!current) {
-        return
-      }
+        let current = this.state.sessions[sessionId]
+        if (!current) {
+          if (this.runs.get(sessionId) === run) this.runs.delete(sessionId)
+          return
+        }
 
-      const context = this.runContext.get(sessionId)
-      if (!context && ['idle', 'failed', 'killed'].includes(current.status)) return
-      current.exitCode = code
-      current.signal = signal
-      current.finishedAt = now()
-      if (code === 0 && !killed && this.runContext.get(sessionId)?.runProducedOutput) delete current.workspaceTransferContextPending
-      current.updatedAt = current.finishedAt
-      recordTurnCheckpointDiff(this.checkpointHost(), sessionId, current.finishedAt)
-      this.appendTurnCompletedIfMissing(sessionId, current.finishedAt)
-      this.cancelOpenRuntimeInteractions(sessionId, current.finishedAt)
-      const killedGoalRun = killed || current.status === 'killed'
-      if (
-        context?.runId &&
-        (context.runKind === 'goal-create' || context.runKind === 'goal-control') &&
-        (current.threadGoal?.status !== 'active' || killedGoalRun)
-      ) {
-        this.finalizeClosedGoalActivities(
-          sessionId,
-          context.runId,
-          current.finishedAt,
-          current.threadGoal?.status,
-          killedGoalRun
-            ? 'Goal run was killed before this activity completed.'
-            : undefined,
-        )
-      }
+        const context = this.runContext.get(sessionId)
+        if (context?.closeStarted) return
+        if (context) context.closeStarted = true
+        if (!context && ['idle', 'failed', 'killed'].includes(current.status)) {
+          if (this.runs.get(sessionId) === run) this.runs.delete(sessionId)
+          return
+        }
+        current.exitCode = code
+        current.signal = signal
+        current.finishedAt = now()
+        if (code === 0 && !killed && this.runContext.get(sessionId)?.runProducedOutput) delete current.workspaceTransferContextPending
+        current.updatedAt = current.finishedAt
+        // A killed turn is already terminal in the durable state. Meter it
+        // before slow checkpoint I/O so restart recovery cannot miss usage.
+        // Successful turns remain running and recoverable until their commit.
+        if (killed || current.status === 'killed') {
+          this.recordUsageFact(sessionId, current.finishedAt)
+          this.touch()
+        }
+        await recordTurnCheckpointDiff(this.checkpointHost(), sessionId, current.finishedAt, this.#checkpoints)
+        if (context?.failureFinalization) await context.failureFinalization
+        if (context && this.runContext.get(sessionId) !== context && !context.failureFinalized) {
+          if (this.runs.get(sessionId) === run) this.runs.delete(sessionId)
+          this.workflowCompensatedRuns.delete(sessionId)
+          return
+        }
+        current = this.state.sessions[sessionId]
+        if (!current) return
+        if (this.runs.get(sessionId) === run) this.runs.delete(sessionId)
+        queueMicrotask(() => { void this.drainRunQueue() })
+        this.appendTurnCompletedIfMissing(sessionId, current.finishedAt)
+        this.cancelOpenRuntimeInteractions(sessionId, current.finishedAt)
+        const killedGoalRun = killed || current.status === 'killed'
+        if (
+          context?.runId &&
+          (context.runKind === 'goal-create' || context.runKind === 'goal-control') &&
+          (current.threadGoal?.status !== 'active' || killedGoalRun)
+        ) {
+          this.finalizeClosedGoalActivities(
+            sessionId,
+            context.runId,
+            current.finishedAt,
+            current.threadGoal?.status,
+            killedGoalRun
+              ? 'Goal run was killed before this activity completed.'
+              : undefined,
+          )
+        }
 
-      if (context?.resourceViolation) {
-        this.failSession(sessionId, context.resourceViolation.message)
-        return
-      }
+        if (context?.resourceViolation && !context.failureFinalization) {
+          this.failSession(sessionId, context.resourceViolation.message)
+          return
+        }
 
-      if (killed || current.status === 'killed') {
-        current.status = 'killed'
-        this.markActiveAssistant(sessionId, 'failed')
-        this.updateNodeStatus(sessionId, 'killed')
-        this.appendProviderRuntimeEvent(sessionId, {
-          id: randomUUID(),
-          ts: current.updatedAt,
-          type: 'session.state',
-          sessionId,
-          status: 'killed',
-        })
-        this.recordUsageFact(sessionId, current.finishedAt)
-        if (context?.runId) this.releaseWorkspaceLease(context.runId, 'revoked')
-        this.runContext.delete(sessionId)
-        this.touch()
-        this.emitRuntimeEvent({
-          type: 'session.killed',
-          sessionId,
-          state: this.getState(),
-          // The kernel fact was appended by the kill command; the process
-          // exit is only its completion, not a second fact.
-          kernelEventId: context?.killedEventId,
-        })
-        return
-      }
+        if (killed || current.status === 'killed') {
+          current.status = 'killed'
+          this.markActiveAssistant(sessionId, 'failed')
+          this.updateNodeStatus(sessionId, 'killed')
+          this.appendProviderRuntimeEvent(sessionId, {
+            id: randomUUID(),
+            ts: current.updatedAt,
+            type: 'session.state',
+            sessionId,
+            status: 'killed',
+          })
+          this.recordUsageFact(sessionId, current.finishedAt)
+          if (context?.runId) this.releaseWorkspaceLease(context.runId, 'revoked')
+          this.runContext.delete(sessionId)
+          this.touch()
+          this.emitRuntimeEvent({
+            type: 'session.killed',
+            sessionId,
+            state: this.getState(),
+            // The kernel fact was appended by the kill command; the process
+            // exit is only its completion, not a second fact.
+            kernelEventId: context?.killedEventId,
+          })
+          return
+        }
 
-      // The provider error event is the terminal authority for a failed run.
-      // It already called failSession (and emitted exactly one kernel fact);
-      // close only supplies process metadata and must not fail the same turn a
-      // second time, because `on: failed` relationships observe those facts.
-      if (current.status === 'failed') {
-        this.touch()
-        return
-      }
+        // The provider error event is the terminal authority for a failed run.
+        // It already called failSession (and emitted exactly one kernel fact);
+        // close only supplies process metadata and must not fail the same turn a
+        // second time, because `on: failed` relationships observe those facts.
+        if (current.status === 'failed') {
+          this.touch()
+          return
+        }
 
-      if (code === 0 && current.status !== 'failed') {
-        const runId = context?.runId
-        void this.dispatchCommand({
-          commandId: `provider-complete:${sessionId}:${runId}`,
-          idempotencyKey: `provider-complete:${sessionId}:${runId}`,
-          kind: 'provider_complete_run',
-          actor: { kind: 'provider', ref: sessionId },
-          causeId: context?.activationEventId,
-          ...(context?.execution ? { execution: clone(context.execution) } : {}),
-          input: { sessionId, runId, exitCode: code, signal },
-        })
-          .then((result) => {
-            this.emitRuntimeEvent({
-              type: 'session.finished',
-              sessionId,
-              state: this.getState(),
-              kernelEventId: result.kernelEventId,
+        if (code === 0 && current.status !== 'failed') {
+          const runId = context?.runId
+          await this.dispatchCommand({
+            commandId: `provider-complete:${sessionId}:${runId}`,
+            idempotencyKey: `provider-complete:${sessionId}:${runId}`,
+            kind: 'provider_complete_run',
+            actor: { kind: 'provider', ref: sessionId },
+            causeId: context?.activationEventId,
+            ...(context?.execution ? { execution: clone(context.execution) } : {}),
+            input: { sessionId, runId, exitCode: code, signal },
+          }, {
+            // Finishing old filesystem work is not a new authorization to
+            // restart queues after killAll suspended this launch epoch.
+            reviveAutonomousDrains: launchLifecycleEpoch === this.#runQueueLifecycleEpoch && this.#runQueueDrainEnabled,
+          })
+            .then((result) => {
+              this.emitRuntimeEvent({
+                type: 'session.finished',
+                sessionId,
+                state: this.getState(),
+                kernelEventId: result.kernelEventId,
+              })
             })
-          })
-          .catch((error) => {
-            if ((error as Error & { code?: string })?.code !== 'ORRERY_EFFECT_DRAIN_CRASH') {
-              this.failSession(sessionId, error instanceof Error ? error.message : String(error))
-            }
-          })
-        return
-      }
+            .catch((error) => {
+              if ((error as Error & { code?: string })?.code !== 'ORRERY_EFFECT_DRAIN_CRASH') {
+                this.failSession(sessionId, error instanceof Error ? error.message : String(error))
+              }
+            })
+          return
+        }
 
-      this.failSession(sessionId, current.error ?? `Claude exited with code ${code ?? 'null'}`)
+        this.failSession(sessionId, current.error ?? `Claude exited with code ${code ?? 'null'}`)
+      })()).catch((error: unknown) => {
+        if (this.runs.get(sessionId) === run) this.runs.delete(sessionId)
+        this.failSession(sessionId, error instanceof Error ? error.message : String(error))
+      })
     })
     return runId
   }
@@ -1022,7 +1150,7 @@ export class SessionRuntimeController {
       (removedEvent) => removedEvent.type === 'turn.diff.updated',
     )
     if (compactEvent.type === 'turn.diff.updated' || removedDiffEvent) {
-      pruneTurnCheckpointRefs(this.checkpointHost(), sessionId)
+      void this.trackWorkspaceOperation(pruneTurnCheckpointRefsAsync(this.checkpointHost(), sessionId, this.#checkpoints))
     }
 
     if (compactEvent.type === 'runtime.configured') {
@@ -1967,6 +2095,7 @@ export class SessionRuntimeController {
     }
 
     const context = this.runContext.get(sessionId)
+    if (context?.failureFinalization) return
     if (
       context &&
       context.runProducedOutput === false &&
@@ -1977,60 +2106,84 @@ export class SessionRuntimeController {
       // activation message, so its listed deliveries become unread again.
       this.channelStore.unmarkRead(sessionId, context.channelReadSeqs)
     }
-    session.status = 'failed'
+    if (this.#host.controlTransactionActive()) {
+      // Compound workflow startup still observes failure synchronously and
+      // can roll its uncommitted participants back exactly as before.
+      session.status = 'failed'
+      this.updateNodeStatus(sessionId, 'failed')
+    }
     session.error = error
     session.finishedAt = now()
     session.updatedAt = session.finishedAt
     this.markActiveAssistant(sessionId, 'failed')
-    this.updateNodeStatus(sessionId, 'failed')
-    recordTurnCheckpointDiff(this.checkpointHost(), sessionId, session.finishedAt)
-    this.appendTurnCompletedIfMissing(sessionId, session.finishedAt)
-    this.cancelOpenRuntimeInteractions(sessionId, session.finishedAt)
-    if (
-      context?.runId &&
-      (context.runKind === 'goal-create' || context.runKind === 'goal-control')
-    ) {
-      this.finalizeClosedGoalActivities(
-        sessionId,
-        context.runId,
-        session.finishedAt,
-        session.threadGoal?.status,
-        'Goal run failed before this activity completed.',
-      )
-    }
-    this.appendProviderRuntimeEvent(sessionId, {
-      id: randomUUID(),
-      ts: session.finishedAt,
-      type: 'session.state',
-      sessionId,
-      status: 'failed',
-    })
     this.recordUsageFact(sessionId, session.finishedAt)
-    if (context?.runId) this.releaseWorkspaceLease(context.runId, 'failed')
-    this.runContext.delete(sessionId)
-    const failedEvent = this.appendKernelEvent(
-      'session.failed',
-      {
-        sessionId,
-        error: truncateForLog(String(error ?? ''), 400),
-        turnId: context?.runId,
-      },
-      ctx ?? {
-        actor: { kind: 'provider' },
-        causeId: context?.activationEventId,
-        ...(context?.execution ? { execution: clone(context.execution) } : {}),
-      },
-    )
-    this.planCouncilFailed(sessionId, String(error ?? 'Unknown provider error'))
-    this.settleDynamicSpawnChild(sessionId, 'failed', String(error ?? 'Unknown provider error'))
+    // Keep this run recoverable until its final diff/terminal fact commits.
     this.touch()
-    this.emitRuntimeEvent({
-      type: 'session.failed',
-      sessionId,
-      error,
-      state: this.getState(),
-      kernelEventId: failedEvent?.id,
-    })
+    const checkpoint = recordTurnCheckpointDiff(this.checkpointHost(), sessionId, session.finishedAt, this.#checkpoints)
+    const finalize = () => {
+      // A workflow rollback may have removed/replaced this run while Git
+      // was finishing. Its old callbacks must not mutate the restored chat.
+      if (context && this.runContext.get(sessionId) !== context) return
+      const session = this.state.sessions[sessionId]
+      if (!session) return
+      if (context) context.failureFinalized = true
+      if (session.status !== 'killed') {
+        session.status = 'failed'
+        this.updateNodeStatus(sessionId, 'failed')
+      }
+      this.appendTurnCompletedIfMissing(sessionId, session.finishedAt)
+      this.cancelOpenRuntimeInteractions(sessionId, session.finishedAt)
+      if (
+        context?.runId &&
+        (context.runKind === 'goal-create' || context.runKind === 'goal-control')
+      ) {
+        this.finalizeClosedGoalActivities(
+          sessionId,
+          context.runId,
+          session.finishedAt,
+          session.threadGoal?.status,
+          'Goal run failed before this activity completed.',
+        )
+      }
+      if (session.status !== 'killed') this.appendProviderRuntimeEvent(sessionId, {
+        id: randomUUID(),
+        ts: session.finishedAt,
+        type: 'session.state',
+        sessionId,
+        status: 'failed',
+      })
+      this.recordUsageFact(sessionId, session.finishedAt)
+      if (context?.runId) this.releaseWorkspaceLease(context.runId, 'failed')
+      this.runContext.delete(sessionId)
+      const failedEvent = this.appendKernelEvent(
+        'session.failed',
+        {
+          sessionId,
+          error: truncateForLog(String(error ?? ''), 400),
+          turnId: context?.runId,
+        },
+        ctx ?? {
+          actor: { kind: 'provider' },
+          causeId: context?.activationEventId,
+          ...(context?.execution ? { execution: clone(context.execution) } : {}),
+        },
+      )
+      this.planCouncilFailed(sessionId, String(error ?? 'Unknown provider error'))
+      this.settleDynamicSpawnChild(sessionId, 'failed', String(error ?? 'Unknown provider error'))
+      this.touch()
+      this.emitRuntimeEvent({
+        type: 'session.failed',
+        sessionId,
+        error,
+        state: this.getState(),
+        kernelEventId: failedEvent?.id,
+      })
+    }
+    if (checkpoint) {
+      const operation = checkpoint.then(finalize)
+      if (context) context.failureFinalization = operation
+      void this.trackWorkspaceOperation(operation)
+    } else finalize()
   }
 
   settleDynamicSpawnChild(

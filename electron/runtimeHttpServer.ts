@@ -3,6 +3,8 @@ import os from 'node:os'
 import path from 'node:path'
 import { URL } from 'node:url'
 import { RuntimeSessionManager } from './runtime/sessionManager.js'
+import { createRuntimeOperationHandler } from './runtime/runtimeApiService.js'
+import { runtimeOperations, runtimeOperationNames, type RuntimeOperationSpec } from '../shared/runtime-operations.js'
 import { createBatchedRuntimeEventEmitter } from './runtime/runtimeEventDelivery.js'
 
 const loopbackHost = '127.0.0.1'
@@ -20,6 +22,7 @@ type RuntimeRouteHandler = (
 type RuntimeRoute = {
   method: string
   pattern: RegExp
+  parameterNames?: string[]
   handler: RuntimeRouteHandler
 }
 
@@ -197,6 +200,43 @@ function decodeParam(value: string | undefined) {
   }
 }
 
+function compilePublicRoutes(runtime: RuntimeSessionManager): RuntimeRoute[] {
+  const invoke = createRuntimeOperationHandler(runtime)
+  return runtimeOperationNames.flatMap((name) => {
+    const spec: RuntimeOperationSpec = runtimeOperations[name]
+    const paths = [spec.http.path, ...(spec.http.alternate ? [spec.http.alternate.path] : [])]
+    return paths.map((path): RuntimeRoute => {
+      const parameterNames = Array.from(path.matchAll(/:([a-zA-Z]+)/g), match => match[1])
+      return {
+        method: spec.http.method,
+        pattern: new RegExp('^/api/runtime/' + path.replace(/:([a-zA-Z]+)/g, '([^/]+)') + '$'),
+        parameterNames,
+        handler: async (request, params) => {
+          const fields = spec.http.method === 'GET'
+            ? Object.fromEntries((spec.http.query ?? []).map(field => [field, queryParams(request).get(field) ?? undefined]))
+            : spec.http.body === 'none' ? {} : await readJsonBody(request)
+          const input = { ...fields, ...params }
+          if (name === 'emitExternalEvent') {
+            // Webhook authentication belongs to HTTP ingress, not to the
+            // shared service or the trusted desktop IPC adapter.
+            const headerToken = request.headers['x-orrery-source-token']
+            const token = typeof headerToken === 'string' ? headerToken : input.token
+            delete input.token
+            if (!runtime.verifyExternalSourceToken(input.sourceId, token)) {
+              throw new RuntimeHttpError(401, 'Invalid or missing source token')
+            }
+          }
+          const run = () => invoke(name, spec.scalar ? input[spec.scalar] : input)
+          if (spec.notFound === 'loop') return notFoundOnUnknownLoop(run)
+          if (spec.notFound === 'session') return notFoundOnUnknownSession(run)
+          if (spec.notFound === 'source') return notFoundOnUnknownSource(run)
+          return run()
+        },
+      }
+    })
+  })
+}
+
 function compileRoutes(
   runtime: RuntimeSessionManager,
   config: JsonRecord,
@@ -212,15 +252,11 @@ function compileRoutes(
       input,
     })
   return [
+    ...compilePublicRoutes(runtime),
     {
       method: 'GET',
       pattern: /^\/api\/runtime\/config$/,
       handler: () => config,
-    },
-    {
-      method: 'GET',
-      pattern: /^\/api\/runtime\/state$/,
-      handler: () => runtime.getState(),
     },
     {
       method: 'GET',
@@ -231,50 +267,6 @@ function compileRoutes(
       method: 'GET',
       pattern: /^\/api\/runtime\/sessions$/,
       handler: () => runtime.listSessionSummaries(),
-    },
-    {
-      method: 'GET',
-      pattern: /^\/api\/runtime\/loops\/([^/]+)\/timeline$/,
-      handler: (_request, params) =>
-        notFoundOnUnknownLoop(() =>
-          runtime.getLoopTimeline({
-            loopId: params.loopId,
-          }),
-        ),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/loops\/([^/]+)\/stop$/,
-      handler: async (request, params) => {
-        const body = await readJsonBody(request)
-        return notFoundOnUnknownLoop(() =>
-          humanCommand('stop_loop', {
-            ...body,
-            loopId: params.loopId,
-          }),
-        )
-      },
-    },
-    {
-      method: 'GET',
-      pattern: /^\/api\/runtime\/kernel-events$/,
-      handler: (request) => {
-        const params = queryParams(request)
-        return runtime.getKernelEvents({
-          since: params.get('since') ?? undefined,
-          limit: params.get('limit') ?? undefined,
-          type: params.get('type') ?? undefined,
-          tail: params.get('tail') ?? undefined,
-        })
-      },
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/commands$/,
-      handler: async (request) => {
-        const command = await readJsonBody(request)
-        return runtime.dispatchCommand({ ...command, actor: { kind: 'human' } })
-      },
     },
     {
       method: 'GET',
@@ -300,94 +292,6 @@ function compileRoutes(
     },
     {
       method: 'POST',
-      pattern: /^\/api\/runtime\/project-context$/,
-      handler: async (request) =>
-        runtime.getProjectContext(await readJsonBody(request)),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/provider-setup-status$/,
-      handler: async (request) =>
-        runtime.getProviderSetupStatus(await readJsonBody(request)),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/provider-instances$/,
-      handler: async (request) =>
-        humanCommand('upsert_provider_instance', await readJsonBody(request)),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/sessions$/,
-      handler: async (request) =>
-        humanCommand('create_session', await readJsonBody(request)),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/native-sessions\/list$/,
-      handler: async (request) =>
-        runtime.listNativeSessions(await readJsonBody(request)),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/native-sessions\/read$/,
-      handler: async (request) =>
-        runtime.readNativeSession(await readJsonBody(request)),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/native-sessions\/import$/,
-      handler: async (request) =>
-        humanCommand('import_native_session', await readJsonBody(request)),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/sessions\/goal$/,
-      handler: async (request) =>
-        humanCommand('set_thread_goal', await readJsonBody(request)),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/sessions\/([^/]+)\/goal$/,
-      handler: async (request, params) =>
-        humanCommand('set_thread_goal', {
-          ...(await readJsonBody(request)),
-          sessionId: params.sessionId,
-        }),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/sessions\/([^/]+)\/goal\/clear$/,
-      handler: async (request, params) =>
-        humanCommand('clear_thread_goal', {
-          ...(await readJsonBody(request)),
-          sessionId: params.sessionId,
-        }),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/sessions\/([^/]+)\/fork$/,
-      handler: async (request, params) => {
-        const body = await readJsonBody(request)
-        return notFoundOnUnknownSession(() =>
-          humanCommand('fork_session', {
-            ...body,
-            sessionId: params.sessionId,
-          }),
-        )
-      },
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/sessions\/([^/]+)\/resume$/,
-      handler: async (request, params) =>
-        humanCommand('resume_session', {
-          ...(await readJsonBody(request)),
-          sessionId: params.sessionId,
-        }),
-    },
-    {
-      method: 'POST',
       pattern: /^\/api\/runtime\/sessions\/([^/]+)\/deliver$/,
       handler: async (request, params) =>
         humanCommand('deliver', {
@@ -406,38 +310,6 @@ function compileRoutes(
     },
     {
       method: 'POST',
-      pattern: /^\/api\/runtime\/sessions\/([^/]+)\/archive$/,
-      handler: async (request, params) =>
-        humanCommand('archive_session', {
-          ...(await readJsonBody(request)),
-          sessionId: params.sessionId,
-        }),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/sessions\/([^/]+)\/kill$/,
-      handler: (_request, params) => humanCommand('kill_session', { sessionId: params.sessionId }),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/requests\/([^/]+)\/respond$/,
-      handler: async (request, params) =>
-        humanCommand('respond_runtime_request', {
-          ...(await readJsonBody(request)),
-          requestId: params.requestId,
-        }),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/user-input\/([^/]+)\/answer$/,
-      handler: async (request, params) =>
-        humanCommand('answer_user_input', {
-          ...(await readJsonBody(request)),
-          requestId: params.requestId,
-        }),
-    },
-    {
-      method: 'POST',
       pattern: /^\/api\/runtime\/edges$/,
       handler: async (request) =>
         humanCommand('link_sessions', await readJsonBody(request)),
@@ -450,224 +322,9 @@ function compileRoutes(
     },
     {
       method: 'POST',
-      pattern: /^\/api\/runtime\/clusters$/,
-      handler: async (request) =>
-        humanCommand('upsert_scope', await readJsonBody(request)),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/clusters\/([^/]+)\/master$/,
-      handler: async (request, params) =>
-        humanCommand('create_master', {
-          ...(await readJsonBody(request)),
-          clusterId: params.clusterId,
-        }),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/clusters\/([^/]+)\/assign-master$/,
-      handler: async (request, params) =>
-        humanCommand('assign_master', {
-          ...(await readJsonBody(request)),
-          clusterId: params.clusterId,
-        }),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/clusters\/([^/]+)\/loop-policy$/,
-      handler: async (request, params) =>
-        humanCommand('set_loop_policy', {
-          ...(await readJsonBody(request)),
-          clusterId: params.clusterId,
-        }),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/clusters\/([^/]+)\/start-loop$/,
-      handler: async (request, params) =>
-        humanCommand('start_loop', {
-          ...(await readJsonBody(request)),
-          clusterId: params.clusterId,
-        }),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/clusters\/([^/]+)\/stop-loop$/,
-      handler: async (request, params) =>
-        humanCommand('stop_loop', {
-          ...(await readJsonBody(request)),
-          clusterId: params.clusterId,
-        }),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/freeze$/,
-      handler: async (request) => humanCommand('freeze', await readJsonBody(request)),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/unfreeze$/,
-      handler: async (request) => runtime.unfreeze(await readJsonBody(request)),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/channels\/cleanup$/,
-      handler: async (request) => runtime.cleanupChannels(await readJsonBody(request)),
-    },
-    {
-      method: 'POST',
       pattern: /^\/api\/runtime\/subscriptions$/,
       handler: async (request) =>
         humanCommand('author_subscription', await readJsonBody(request)),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/goal-loops$/,
-      handler: async (request) =>
-        humanCommand('create_goal_loop', await readJsonBody(request)),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/subscriptions\/([^/]+)\/stop$/,
-      handler: async (request, params) =>
-        humanCommand('stop_subscription', {
-          ...(await readJsonBody(request)),
-          subscriptionId: params.subscriptionId,
-        }),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/sources$/,
-      handler: async (request) =>
-        humanCommand('register_external_source', await readJsonBody(request)),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/sources\/([^/]+)\/remove$/,
-      handler: async (request, params) => {
-        const body = await readJsonBody(request)
-        return notFoundOnUnknownSource(() =>
-          humanCommand('remove_external_source', {
-            ...body,
-            sourceId: params.sourceId,
-          }),
-        )
-      },
-    },
-    {
-      // The L2 ingestion endpoint — this IS the webhook form of a source:
-      // point any local sender (curl, CI hook relay, npm run emit) at it.
-      method: 'POST',
-      pattern: /^\/api\/runtime\/external-events$/,
-      handler: async (request) => {
-        const body = await readJsonBody(request)
-        const headerToken = request.headers['x-orrery-source-token']
-        const token = typeof headerToken === 'string' ? headerToken : body.token
-        delete body.token
-        if (!runtime.verifyExternalSourceToken(body.sourceId, token)) {
-          throw new RuntimeHttpError(401, 'Invalid or missing source token')
-        }
-        return notFoundOnUnknownSource(() => runtime.emitExternalEvent(body))
-      },
-    },
-    {
-      method: 'GET',
-      pattern: /^\/api\/runtime\/templates$/,
-      handler: async () => runtime.listTemplates(),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/templates\/apply$/,
-      handler: async (request) =>
-        humanCommand('apply_template', await readJsonBody(request)),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/review-workflows$/,
-      handler: async (request) =>
-        humanCommand('start_review_workflow', await readJsonBody(request)),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/plan-councils$/,
-      handler: async (request) =>
-        humanCommand('start_plan_council', await readJsonBody(request)),
-    },
-    {
-      method: 'GET',
-      pattern: /^\/api\/runtime\/plan-councils\/([^/]+)$/,
-      handler: async (_request, params) => runtime.getPlanCouncil(params),
-    },
-    {
-      method: 'GET',
-      pattern: /^\/api\/runtime\/plan-councils\/([^/]+)\/artifacts\/([^/]+)$/,
-      handler: async (_request, params) => runtime.getPlanCouncilArtifact(params),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/plan-councils\/([^/]+)\/cross-review$/,
-      handler: async (request, params) =>
-        humanCommand('start_plan_council_cross_review', {
-          ...(await readJsonBody(request)),
-          workflowId: params.workflowId,
-        }),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/plan-councils\/([^/]+)\/synthesis$/,
-      handler: async (request, params) =>
-        humanCommand('start_plan_council_synthesis', {
-          ...(await readJsonBody(request)),
-          workflowId: params.workflowId,
-        }),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/plan-councils\/([^/]+)\/stop$/,
-      handler: async (request, params) =>
-        humanCommand('stop_plan_council', {
-          ...(await readJsonBody(request)),
-          workflowId: params.workflowId,
-        }),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/draft-workflows$/,
-      handler: async (request) =>
-        humanCommand('start_draft_workflow', await readJsonBody(request)),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/handoff-workflows$/,
-      handler: async (request) =>
-        humanCommand('start_handoff_workflow', await readJsonBody(request)),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/goal-workflows\/start$/,
-      handler: async (request) =>
-        humanCommand('start_goal_workflow', await readJsonBody(request)),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/agent-connections$/,
-      handler: async (request) =>
-        humanCommand('connect_agents', await readJsonBody(request)),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/templates\/save$/,
-      handler: async (request) =>
-        humanCommand('save_template', await readJsonBody(request)),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/templates\/([^/]+)\/remove$/,
-      handler: async (request, params) =>
-        humanCommand('remove_template', {
-          ...(await readJsonBody(request)),
-          templateId: params.templateId,
-        }),
     },
     {
       method: 'POST',
@@ -680,93 +337,17 @@ function compileRoutes(
       pattern: /^\/api\/runtime\/activations\/deny$/,
       handler: async (request) =>
         humanCommand('deny_activation', await readJsonBody(request)),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/node-positions$/,
-      handler: async (request) =>
-        humanCommand('update_node_positions', await readJsonBody(request)),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/working-tree-diff$/,
-      handler: async (request) =>
-        runtime.getWorkingTreeDiff(await readJsonBody(request)),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/workspace-files$/,
-      handler: async (request) =>
-        runtime.getWorkspaceFiles(await readJsonBody(request)),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/workspace-file-content$/,
-      handler: async (request) =>
-        runtime.getWorkspaceFileContent(await readJsonBody(request)),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/open-workspace$/,
-      handler: async (request) =>
-        runtime.openWorkspace(await readJsonBody(request)),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/terminals$/,
-      handler: async (request) =>
-        runtime.createTerminal(await readJsonBody(request)),
-    },
-    {
-      method: 'GET',
-      pattern: /^\/api\/runtime\/terminals\/([^/]+)$/,
-      handler: async (_request, params) =>
-        runtime.getTerminal({
-          terminalId: params.terminalId,
-        }),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/terminals\/([^/]+)\/command$/,
-      handler: async (request, params) =>
-        runtime.runTerminalCommand({
-          ...(await readJsonBody(request)),
-          terminalId: params.terminalId,
-        }),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/terminals\/([^/]+)\/stdin$/,
-      handler: async (request, params) =>
-        runtime.writeTerminalInput({
-          ...(await readJsonBody(request)),
-          terminalId: params.terminalId,
-        }),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/terminals\/([^/]+)\/clear$/,
-      handler: async (_request, params) =>
-        runtime.clearTerminal({
-          terminalId: params.terminalId,
-        }),
-    },
-    {
-      method: 'POST',
-      pattern: /^\/api\/runtime\/terminals\/([^/]+)\/close$/,
-      handler: async (_request, params) =>
-        runtime.closeTerminal({
-          terminalId: params.terminalId,
-        }),
-    },
+    }
   ]
 }
 
-function routeParams(pattern: RegExp, pathname: string) {
+function routeParams(pattern: RegExp, pathname: string, parameterNames?: string[]) {
   const match = pattern.exec(pathname)
   if (!match) {
     return undefined
   }
+
+  if (parameterNames) return Object.fromEntries(parameterNames.map((name, index) => [name, decodeParam(match[index + 1])]))
 
   if (pathname.includes('/sessions/') && match[1]) {
     return { sessionId: decodeParam(match[1]) }
@@ -954,7 +535,7 @@ export function createRuntimeHttpServer(
     }
 
     try {
-      const params = routeParams(route.pattern, pathname) ?? {}
+      const params = routeParams(route.pattern, pathname, route.parameterNames) ?? {}
       const result = await route.handler(request, params)
       if (request.method === 'HEAD') {
         response.writeHead(200, {

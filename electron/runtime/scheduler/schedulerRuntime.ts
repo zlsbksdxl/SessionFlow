@@ -3,6 +3,7 @@
 // reconciliation. RuntimeSessionManager remains the sole command/transaction
 // authority and supplies the explicit host port below.
 import { createHash } from 'node:crypto'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import {
   type KernelState,
   defaultCycleMaxFirings,
@@ -21,6 +22,7 @@ import { normalizeSubscriptionInput } from '../subscriptionAuthoring.js'
 import { pendingRequestText, renderExternalEventMarkdown, renderReportMarkdown } from '../reports/reportFormatting.js'
 
 export type SchedulerHost = {
+  lifecycle(): { epoch: number; enabled: boolean; authorizedCommandEpoch?: number }
   state(): JsonRecord
   runs(): Map<string, JsonRecord>
   queries(): {
@@ -69,11 +71,13 @@ const schedulerTriggerEventTypes = new Set([
   'external.timer',
 ])
 const maxSetTimeoutDelayMs = 2_147_483_647
+type SchedulerWork = { epoch: number; allowWhileSuspended: boolean }
 
 export class SchedulerRuntime {
   #host: SchedulerHost
   private schedulerChain: Promise<void> = Promise.resolve()
   private timers = new Map<string, ReturnType<typeof setTimeout>>()
+  private workContext = new AsyncLocalStorage<SchedulerWork>()
 
   constructor(host: SchedulerHost) {
     this.#host = host
@@ -92,7 +96,34 @@ export class SchedulerRuntime {
     return this.#host.kernelStore()
   }
   private dispatchCommand(command: JsonRecord) {
+    if (!this.currentWorkIsActive()) return Promise.resolve({ ok: false, suspended: true })
     return this.#host.dispatchCommand(command)
+  }
+
+  private currentWork(): SchedulerWork {
+    const inherited = this.workContext.getStore()
+    if (inherited) return inherited
+    const lifecycle = this.#host.lifecycle()
+    return { epoch: lifecycle.epoch, allowWhileSuspended: lifecycle.authorizedCommandEpoch === lifecycle.epoch }
+  }
+
+  private workIsActive(work: SchedulerWork) {
+    const lifecycle = this.#host.lifecycle()
+    return lifecycle.epoch === work.epoch && (lifecycle.enabled || work.allowWhileSuspended)
+  }
+
+  private currentWorkIsActive() {
+    return this.workIsActive(this.currentWork())
+  }
+
+  private assertCurrentWork() {
+    if (!this.currentWorkIsActive()) throw new Error('Subscription scheduler work was cancelled by runtime shutdown.')
+  }
+
+  private withCurrentWork<T>(task: () => Promise<T>): Promise<T | undefined> {
+    const work = this.currentWork()
+    if (!this.workIsActive(work)) return Promise.resolve(undefined)
+    return this.workContext.run(work, task)
   }
   private dispatchRecoveryCommandSync(input: RecoveryControlCommand) {
     return this.#host.dispatchRecoveryCommandSync(input)
@@ -178,21 +209,35 @@ export class SchedulerRuntime {
 
   // Scheduler work is post-commit automation: errors are reported at this
   // boundary and must not reject the already-committed command that queued it.
-  enqueueWork(task: () => Promise<any> | any, onError: (error: unknown) => void): void {
+  enqueueWork(task: () => Promise<any> | any, onError: (error: unknown) => void, authorizedLifecycleEpoch?: number): void {
+    // A scheduler task is background work, never a new authorization to revive
+    // a closed runtime. Capture before chaining: ALS from the originating
+    // control command may already be absent by the time this task runs.
+    const lifecycle = this.#host.lifecycle()
+    const inherited = this.workContext.getStore()
+    if (inherited && !this.workIsActive(inherited)) return
+    if (authorizedLifecycleEpoch !== undefined && authorizedLifecycleEpoch !== lifecycle.epoch) return
+    // Committed events are published just before the command's admission
+    // effect resumes drains. This private provenance preserves that first
+    // fresh fact without treating arbitrary late runtime facts as authority.
+    if (!lifecycle.enabled && lifecycle.authorizedCommandEpoch !== lifecycle.epoch && authorizedLifecycleEpoch !== lifecycle.epoch) return
+    const work = { epoch: authorizedLifecycleEpoch ?? inherited?.epoch ?? lifecycle.epoch, allowWhileSuspended: false }
     this.schedulerChain = this.schedulerChain
       .catch(() => undefined)
-      .then(task)
+      .then(() => this.workIsActive(work) ? this.workContext.run(work, task) : undefined)
       .catch((error) => {
         onError(error)
       })
   }
 
   async cmdRuleExecuteActivation(input: JsonRecord) {
-    const slot = this.state.pendingActivations?.[input.slotKey]
-    const subscription = slot ? this.state.subscriptions?.[slot.subscriptionId] : undefined
-    if (!slot || !subscription) return { ok: false }
-    await this.executeApprovedSlot(slot, subscription)
-    return { ok: true }
+    return await this.withCurrentWork(async () => {
+      const slot = this.state.pendingActivations?.[input.slotKey]
+      const subscription = slot ? this.state.subscriptions?.[slot.subscriptionId] : undefined
+      if (!slot || !subscription) return { ok: false }
+      await this.executeApprovedSlot(slot, subscription)
+      return { ok: true }
+    }) ?? { ok: false, suspended: true }
   }
 
   cmdRuleDropActivation(input: JsonRecord, ctx: JsonRecord) {
@@ -240,7 +285,7 @@ export class SchedulerRuntime {
 
   // Single-threaded scheduler (§2.4): kernel facts are processed strictly in
   // append order through one promise chain.
-  enqueueSchedulerEvent(event) {
+  enqueueSchedulerEvent(event, authorizedLifecycleEpoch?: number) {
     // External facts are `external.<topic>` with source-declared topics, so
     // the trigger set is open-ended by prefix (L2); everything else stays
     // on the exact-type allowlist.
@@ -257,10 +302,12 @@ export class SchedulerRuntime {
           `Subscription scheduler failed on ${event.type} (${event.id}): ${error instanceof Error ? error.message : String(error)}`,
         )
       },
+      authorizedLifecycleEpoch,
     )
   }
 
   private async processSchedulerEvent(event) {
+    if (!this.currentWorkIsActive()) return
     if (event.type === 'session.killed') {
       // Kill parity with the old hero loop: a killed participant stops the
       // subscriptions it takes part in (a killed session never emits again
@@ -280,6 +327,7 @@ export class SchedulerRuntime {
 
     const decisions = evaluateSubscriptions(this.queries.kernelView(), event)
     for (const decision of decisions) {
+      if (!this.currentWorkIsActive()) return
       const ctx = this.ruleContext(decision.subscriptionId, event.id)
       if (decision.kind === 'stop-subscription') {
         await this.dispatchCommand({
@@ -477,6 +525,7 @@ export class SchedulerRuntime {
   }
 
   private async notifyMasterOfPending(slot, subscription, event, ctx) {
+    if (!this.currentWorkIsActive()) return
     const master = this.state.sessions[slot.masterSessionId]
     if (!master) {
       return
@@ -591,6 +640,10 @@ export class SchedulerRuntime {
   // this is where coalesce's "fire once when idle, with the latest context"
   // becomes real.
   async drainApprovedSlots() {
+    await this.withCurrentWork(() => this.drainApprovedSlotsInCurrentWork())
+  }
+
+  private async drainApprovedSlotsInCurrentWork() {
     // Oldest pending fact first: this is the ordered drain for queue
     // backlogs (§6.1). Coalesce/drop/interrupt hold at most one slot per
     // edge, so the order is inert for them. Firing a queue entry makes the
@@ -599,6 +652,7 @@ export class SchedulerRuntime {
       .filter((slot) => slot.status === 'approved')
       .sort((a, b) => (a.orderSeq ?? 0) - (b.orderSeq ?? 0))
     for (const slot of slots) {
+      if (!this.currentWorkIsActive()) return
       if (!this.state.pendingActivations?.[slot.slotKey]) {
         continue
       }
@@ -662,6 +716,7 @@ export class SchedulerRuntime {
   }
 
   private async executeApprovedSlot(slot, subscription) {
+    this.assertCurrentWork()
     const ctx: JsonRecord = this.ruleContext(slot.subscriptionId, slot.triggerEventId)
     if (validateExecutionEnvelope(slot.execution)) {
       ctx.execution = clone(slot.execution)
@@ -819,6 +874,7 @@ export class SchedulerRuntime {
     this.state.dynamicSpawnGroups[groupId] = group
     const prepared: Array<{ sessionId: string; run: JsonRecord }> = []
     for (const [index, issue] of issues.slice(0, allowedCount).entries()) {
+      this.assertCurrentWork()
       const itemKey = dynamicItemKey(issue, index)
       const context = [
         '# Assigned issue',
@@ -854,6 +910,7 @@ export class SchedulerRuntime {
         ctx,
         { deferStart: true },
       )
+      this.assertCurrentWork()
       this.state.sessions[created.sessionId].dynamicTopology = {
         groupId,
         templateId: action.template.templateId,
@@ -874,6 +931,7 @@ export class SchedulerRuntime {
     // above are the template-level static resource check.
     delete this.state.pendingActivations[slot.slotKey]
     for (const item of prepared) {
+      this.assertCurrentWork()
       delete this.state.sessions[item.sessionId].prepared
       const runId = await this.startRun(item.sessionId, {
         prompt: item.run.prompt,
@@ -884,6 +942,7 @@ export class SchedulerRuntime {
         channelReadSeqs: item.run.channelReadSeqs,
         ...(slot.execution ? { execution: clone(slot.execution) } : {}),
       })
+      this.assertCurrentWork()
       const child = group.children.find((candidate) => candidate.sessionId === item.sessionId)
       if (child) Object.assign(child, { status: 'running', runId })
     }
@@ -1195,9 +1254,12 @@ export class SchedulerRuntime {
     if (subscription.state !== 'active') {
       return
     }
+    const work = this.currentWork()
+    if (!this.workIsActive(work)) return
     const delayMs = this.timerDelayMs(subscription)
     const handle = setTimeout(
       () => {
+        if (!this.workIsActive(work)) return
         if (delayMs > maxSetTimeoutDelayMs) {
           // Node overflows larger delays to ~1ms. Re-arm from the durable
           // anchor until the real due time fits instead of emitting early.
