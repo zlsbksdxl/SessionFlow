@@ -1,0 +1,204 @@
+name: Recover SessionFlow 0.3.2 assets
+
+on:
+  push:
+    branches: [codex/release-v0.3.2-recovery]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-macos-arm64
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      GH_REPO: zlsbksdxl/SessionFlow
+      RELEASE_ID: '429756121'
+      RELEASE_TAG: v0.3.2
+      RELEASE_VERSION: '0.3.2'
+      RELEASE_NAME: SessionFlow 0.3.2
+      RELEASE_COMMIT: 20ebf01a4be90e9740175b71b0620dba43c08567
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 20ebf01a4be90e9740175b71b0620dba43c08567
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Guard the existing draft and preserve its English notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$RELEASE_COMMIT"
+          cat > "$RUNNER_TEMP/guard-release.mjs" <<'NODE'
+          import assert from 'node:assert/strict';
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import { createHash } from 'node:crypto';
+          const [file, phase] = process.argv.slice(2);
+          const release = JSON.parse(fs.readFileSync(file, 'utf8'));
+          const env = process.env;
+          const prefix = `SessionFlow-${env.RELEASE_VERSION}-mac-arm64`;
+          const names = [`${prefix}.dmg`, `${prefix}.zip`, `${prefix}.dmg.blockmap`, `${prefix}.zip.blockmap`, 'latest-mac.yml', 'SHA256SUMS'];
+          assert.equal(release.id, Number(env.RELEASE_ID));
+          assert.equal(release.tag_name, env.RELEASE_TAG);
+          assert.equal(release.name, env.RELEASE_NAME);
+          assert.equal(release.target_commitish, env.RELEASE_COMMIT);
+          assert.equal(release.draft, phase !== 'published');
+          assert.equal(release.prerelease, false);
+          assert.equal(typeof release.body, 'string');
+          assert.ok(release.body.trim(), 'Release notes must not be empty');
+          assert.ok(!/\p{Script=Han}/u.test(release.body), 'Release notes must stay English');
+          const notes = path.join(env.RUNNER_TEMP, 'original-release-notes.md');
+          if (phase === 'capture') fs.writeFileSync(notes, release.body);
+          else assert.equal(release.body, fs.readFileSync(notes, 'utf8'), 'Draft notes changed during recovery');
+          assert.ok(release.assets.every(asset => names.includes(asset.name)), 'Unexpected assets in this draft');
+          if (phase === 'uploaded' || phase === 'published') {
+            assert.equal(release.assets.length, names.length);
+            for (const name of names) {
+              const asset = release.assets.find(value => value.name === name);
+              assert.ok(asset, `Missing asset: ${name}`);
+              const local = path.join('outputs/release', name);
+              assert.equal(asset.state, 'uploaded', `Incomplete asset: ${name}`);
+              assert.equal(asset.size, fs.statSync(local).size, `Size mismatch: ${name}`);
+              const hash = createHash('sha256');
+              for await (const chunk of fs.createReadStream(local)) hash.update(chunk);
+              assert.equal(asset.digest, `sha256:${hash.digest('hex')}`, `Digest mismatch: ${name}`);
+            }
+          }
+          console.log(`Verified ${release.tag_name}: ${phase}`);
+          NODE
+          gh api "repos/$GH_REPO/releases/$RELEASE_ID" > "$RUNNER_TEMP/release.json"
+          node "$RUNNER_TEMP/guard-release.mjs" "$RUNNER_TEMP/release.json" capture
+          if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            test "$(git rev-parse "$RELEASE_TAG^{commit}")" = "$RELEASE_COMMIT"
+          fi
+
+      - name: Install and run deterministic checks
+        run: |
+          npm ci
+          npm run test:ci
+
+      - name: Build ad-hoc macOS arm64 archives
+        run: npm run dist:mac:adhoc
+
+      - name: Verify the app and archives and create checksums
+        id: assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          app=outputs/release/mac-arm64/SessionFlow.app
+          plist="$app/Contents/Info.plist"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleName' "$plist")" = SessionFlow
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$plist")" = SessionFlow
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")" = "$RELEASE_VERSION"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist")" = "$RELEASE_VERSION"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist")" = com.observedobserver.looperators
+          test "$(lipo -archs "$app/Contents/MacOS/SessionFlow")" = arm64
+          codesign --verify --deep --strict --verbose=2 "$app"
+          signature="$(codesign -dv --verbose=4 "$app" 2>&1)"
+          grep -qx 'Signature=adhoc' <<< "$signature"
+          grep -qx 'owner: zlsbksdxl' "$app/Contents/Resources/app-update.yml"
+          grep -qx 'repo: SessionFlow' "$app/Contents/Resources/app-update.yml"
+          grep -qx 'provider: github' "$app/Contents/Resources/app-update.yml"
+          # Host Node reads the archive; never execute the arm64 application.
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import fs from 'node:fs';
+          import { createHash } from 'node:crypto';
+          import { createRequire } from 'node:module';
+          const require = createRequire(process.cwd() + '/package.json');
+          const asar = require('@electron/asar');
+          const archive = 'outputs/release/mac-arm64/SessionFlow.app/Contents/Resources/app.asar';
+          const pkg = JSON.parse(asar.extractFile(archive, 'package.json'));
+          assert.equal(pkg.version, process.env.RELEASE_VERSION);
+          assert.equal(pkg.main, 'dist-electron/electron/main.js');
+          const names = asar.listPackage(archive).map(name => name.replace(/^\//, ''));
+          for (const name of ['dist/index.html', pkg.main, 'dist-electron/electron/desktop/lifecycleCoordinator.js', 'dist-electron/electron/desktop/quitRequest.js', 'dist-electron/electron/runtime/runtimeApiService.js', 'dist-electron/electron/runtime/sessions/runtimeRunContext.js', 'dist-electron/electron/runtime/workspace/gitCheckpointService.js', 'dist-electron/shared/runtime-operations.js']) assert.ok(names.includes(name), `Missing ${name}`);
+          assert.ok(!names.some(name => name.split('/').some(part => ['.git', '.env', 'internal_docs', 'outputs'].includes(part) || part.startsWith('.env.'))));
+          assert.ok(!names.some(name => !name.startsWith('node_modules/') && name.split('/').includes('tests')));
+          const prefix = `SessionFlow-${process.env.RELEASE_VERSION}-mac-arm64`;
+          const metadata = require('js-yaml').load(fs.readFileSync('outputs/release/latest-mac.yml', 'utf8'));
+          assert.equal(metadata.version, process.env.RELEASE_VERSION);
+          assert.deepEqual(metadata.files.map(file => file.url).sort(), [`${prefix}.dmg`, `${prefix}.zip`].sort());
+          for (const file of metadata.files) {
+            const local = `outputs/release/${file.url}`;
+            assert.equal(file.size, fs.statSync(local).size);
+            const hash = createHash('sha512');
+            for await (const chunk of fs.createReadStream(local)) hash.update(chunk);
+            assert.equal(file.sha512, hash.digest('base64'));
+          }
+          NODE
+          cd outputs/release
+          prefix="SessionFlow-${RELEASE_VERSION}-mac-arm64"
+          for file in "$prefix.dmg" "$prefix.zip" "$prefix.dmg.blockmap" "$prefix.zip.blockmap" latest-mac.yml; do test -s "$file"; done
+          hdiutil verify "$prefix.dmg"
+          unzip -tq "$prefix.zip"
+          grep -Fxq "version: $RELEASE_VERSION" latest-mac.yml
+          grep -Fq "url: $prefix.zip" latest-mac.yml
+          shasum -a 256 "$prefix.dmg" "$prefix.zip" "$prefix.dmg.blockmap" "$prefix.zip.blockmap" latest-mac.yml > SHA256SUMS
+          shasum -a 256 -c SHA256SUMS
+          echo 'ready=true' >> "$GITHUB_OUTPUT"
+
+      - name: Upload the complete matching set to the existing draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api "repos/$GH_REPO/releases/$RELEASE_ID" > "$RUNNER_TEMP/release.json"
+          node "$RUNNER_TEMP/guard-release.mjs" "$RUNNER_TEMP/release.json" draft
+          prefix="outputs/release/SessionFlow-${RELEASE_VERSION}-mac-arm64"
+          gh release upload "$RELEASE_TAG" "$prefix.dmg" "$prefix.zip" "$prefix.dmg.blockmap" "$prefix.zip.blockmap" outputs/release/latest-mac.yml outputs/release/SHA256SUMS --clobber
+          verified=false
+          for attempt in 1 2 3 4 5; do
+            gh api "repos/$GH_REPO/releases/$RELEASE_ID" > "$RUNNER_TEMP/release.json"
+            if node "$RUNNER_TEMP/guard-release.mjs" "$RUNNER_TEMP/release.json" uploaded; then verified=true; break; fi
+            sleep 3
+          done
+          test "$verified" = true
+
+      - name: Publish this verified draft as the normal latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Recheck draft ownership, notes, asset hashes, and any existing tag.
+          gh api "repos/$GH_REPO/releases/$RELEASE_ID" > "$RUNNER_TEMP/release.json"
+          node "$RUNNER_TEMP/guard-release.mjs" "$RUNNER_TEMP/release.json" uploaded
+          tag_count="$(gh api "repos/$GH_REPO/git/matching-refs/tags/$RELEASE_TAG" --jq '[.[] | select(.ref == "refs/tags/v0.3.2")] | length')"
+          if test "$tag_count" != 0; then
+            test "$(gh api "repos/$GH_REPO/commits/$RELEASE_TAG" --jq .sha)" = "$RELEASE_COMMIT"
+          fi
+          gh release edit "$RELEASE_TAG" --draft=false --prerelease=false --latest --target "$RELEASE_COMMIT" --title "$RELEASE_NAME" --notes-file "$RUNNER_TEMP/original-release-notes.md"
+          gh api "repos/$GH_REPO/releases/latest" > "$RUNNER_TEMP/latest-release.json"
+          node "$RUNNER_TEMP/guard-release.mjs" "$RUNNER_TEMP/latest-release.json" published
+          test "$(gh api "repos/$GH_REPO/commits/$RELEASE_TAG" --jq .sha)" = "$RELEASE_COMMIT"
+
+      - name: Retain the six verified artifacts even if upload or publishing fails
+        if: ${{ always() && steps.assets.outputs.ready == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: SessionFlow-0.3.2-macos-arm64-recovery
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
+          path: |
+            outputs/release/SessionFlow-0.3.2-mac-arm64.dmg
+            outputs/release/SessionFlow-0.3.2-mac-arm64.zip
+            outputs/release/SessionFlow-0.3.2-mac-arm64.dmg.blockmap
+            outputs/release/SessionFlow-0.3.2-mac-arm64.zip.blockmap
+            outputs/release/latest-mac.yml
+            outputs/release/SHA256SUMS
